@@ -1,0 +1,678 @@
+#!/usr/bin/env bash
+#
+# chezmoi-cryptpath: helper for managing chezmoi entries that use the
+# crypt/<id>.{age,yaml.age} "encrypted path" scheme materialized by the
+# hidden_filenames.bash hook.
+#
+# This script intentionally has no source-tree dependency on the hook: the
+# alt_path helper below is copied from .hooks/hidden_filenames.bash.
+
+set -euo pipefail
+shopt -s nullglob
+
+PROGRAM="$(basename "$0")"
+HOME_DIR="${HOME%/}"
+SOURCE_DIR=""
+CRYPT_DIR=""
+
+# Marker prefix used by `list-clear` for files whose content is encrypted
+# despite having a clear-text source path.
+ENCRYPTED_MARKER='🔒 '
+
+usage() {
+	cat <<EOF
+Helper for chezmoi entries using the crypt/<id>.{age,yaml.age} encrypted-path scheme
+
+Usage:
+  $PROGRAM [command]
+
+Listing commands:
+  list-encrypted       List target paths managed via the crypt/ encrypted-path scheme
+  list-clear           List target paths with clear-text source paths
+
+Modification commands:
+  mv                   Move target file(s); rewrites crypt dst metadata to match
+  forget               Remove crypt entries; leaves the target file alone
+  use-existing-path    Rewrite crypt dst to match an existing alt-prefixed source path
+
+Conversion commands:
+  to-encrypted-path    Convert file(s) to the crypt/ encrypted-path scheme
+  to-encrypted         Convert file(s) to chezmoi-encrypted with clear path
+  to-unencrypted       Convert file(s) to chezmoi-managed unencrypted
+
+Flags:
+  -h, --help           help for $PROGRAM
+
+Use "$PROGRAM [command] --help" for more information about a command.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# per-command help
+# ----------------------------------------------------------------------------
+
+help_for() {
+	case "$1" in
+		list-encrypted)
+			cat <<EOF
+Description
+  List target paths managed via the crypt/<id>.{age,yaml.age} encrypted-path
+  scheme. Listings are recursive.
+
+Usage:
+  $PROGRAM list-encrypted [path]
+
+Arguments:
+  path   Optional. Defaults to the current working directory when it is inside
+         \$HOME, otherwise to \$HOME.
+EOF
+			;;
+		list-clear)
+			cat <<EOF
+Description
+  List target paths with clear-text source paths. Files whose content is
+  encrypted (despite the clear-text path) are prefixed with '${ENCRYPTED_MARKER}'.
+  Listings are recursive.
+
+Usage:
+  $PROGRAM list-clear [path]
+
+Arguments:
+  path   Optional. Defaults to the current working directory when it is inside
+         \$HOME, otherwise to \$HOME.
+EOF
+			;;
+		mv)
+			cat <<EOF
+Description
+  Move or rename target file(s) and rewrite the crypt dst metadata to match.
+  Behaves like /bin/mv: with one SRC, DST may be the new path or an existing
+  directory; with multiple SRCs, DST must be an existing directory.
+
+Usage:
+  $PROGRAM mv source... destination
+
+Examples:
+  $PROGRAM mv ~/.config/foo ~/.config/bar
+  $PROGRAM mv ~/.config/a ~/.config/b ~/.config/dir/
+EOF
+			;;
+		forget)
+			cat <<EOF
+Description
+  Remove crypt entries for the given file(s). The target file itself is left
+  untouched.
+
+Usage:
+  $PROGRAM forget file...
+EOF
+			;;
+		use-existing-path)
+			cat <<EOF
+Description
+  Rewrite the crypt dst to match an existing alt-prefixed source path. Useful
+  when an entry's dst no longer agrees with chezmoi's prefix conventions for
+  the source path that already exists on disk.
+
+Usage:
+  $PROGRAM use-existing-path file...
+EOF
+			;;
+		to-encrypted-path)
+			cat <<EOF
+Description
+  Convert file(s) to the crypt/<id>.{age,yaml.age} encrypted-path scheme. The
+  file is added (if not already managed), encrypted, then moved into crypt/
+  with its dst recorded in the encrypted yaml sidecar.
+
+Usage:
+  $PROGRAM to-encrypted-path file...
+EOF
+			;;
+		to-encrypted)
+			cat <<EOF
+Description
+  Convert file(s) to chezmoi-encrypted with a clear (non-crypt) source path.
+  If currently in the crypt scheme, the crypt entries are removed and the
+  hardlinked source file is kept.
+
+Usage:
+  $PROGRAM to-encrypted file...
+EOF
+			;;
+		to-unencrypted)
+			cat <<EOF
+Description
+  Convert file(s) to chezmoi-managed unencrypted. If currently in the crypt
+  scheme, detaches the hardlink and re-adds the file unencrypted.
+
+Usage:
+  $PROGRAM to-unencrypted file...
+EOF
+			;;
+		*)
+			echo "Unknown command: $1" >&2
+			usage >&2
+			exit 1
+			;;
+	esac
+}
+
+# ----------------------------------------------------------------------------
+# alt_path: copy from .hooks/hidden_filenames.bash. Probe whether a literal
+# source-relative path is already represented in the real source dir under a
+# (possibly different chezmoi-prefixed) path that resolves to the same target.
+# Returns the absolute existing source path, or empty.
+# ----------------------------------------------------------------------------
+
+_alt_state=""
+_alt_mock=""
+_cleanup_paths=()
+
+_cleanup() {
+	local p
+	for p in "${_cleanup_paths[@]+"${_cleanup_paths[@]}"}"; do
+		rm -rf "$p"
+	done
+}
+trap _cleanup EXIT
+
+_alt_init() {
+	[[ -n "$_alt_mock" ]] && return 0
+	_alt_state="$(mktemp -u "/tmp/chezmoi-cryptpath-state-XXXXXX")"
+	_alt_mock="$(mktemp -u "/tmp/chezmoi-cryptpath-mock-XXXXXX")"
+	_cleanup_paths+=("$_alt_state" "$_alt_mock")
+}
+
+_chezmoi_alt() {
+	command chezmoi --persistent-state "$_alt_state" "$@"
+}
+
+alt_path() (
+	kind="$1"
+	cur="$2"
+	mock="$_alt_mock/$cur"
+
+	trap '(cd "$_alt_mock" 2>/dev/null && rm -rf "${cur%%/*}") || true' EXIT
+
+	if [[ "$kind" == "dir" ]]; then
+		mkdir -p "$mock"
+	elif [[ "$kind" == "file" ]]; then
+		mkdir -p "$(dirname "$mock")"
+		: >"$mock"
+	else
+		echo "alt_path: kind must be 'dir' or 'file', got: $kind" >&2
+		return 2
+	fi
+
+	resolved_target="$(_chezmoi_alt -S "$_alt_mock" target-path "$mock")"
+	alt="$(_chezmoi_alt source-path "$resolved_target" 2>/dev/null)" || true
+
+	echo "$alt"
+	[[ -n "$alt" ]]
+)
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+
+_init() {
+	SOURCE_DIR="$(chezmoi source-path)"
+	CRYPT_DIR="$SOURCE_DIR/crypt"
+}
+
+abs_path() {
+	local p="$1"
+	case "$p" in
+		/*) printf '%s\n' "$p" ;;
+		'~'|'~/'*) printf '%s\n' "$HOME_DIR/${p#\~/}" ;;
+		*) printf '%s\n' "$PWD/$p" ;;
+	esac
+}
+
+# Default PATH when no argument is given: cwd if it's inside $HOME, else $HOME.
+default_path() {
+	local cwd; cwd="$(pwd -P)"
+	if [[ "$cwd" == "$HOME_DIR" || "$cwd" == "$HOME_DIR"/* ]]; then
+		printf '%s\n' "$cwd"
+	else
+		printf '%s\n' "$HOME_DIR"
+	fi
+}
+
+home_rel() {
+	local p="$1"
+	if [[ "$p" == "$HOME_DIR" ]]; then
+		printf ''
+	elif [[ "$p" == "$HOME_DIR/"* ]]; then
+		printf '%s\n' "${p#"$HOME_DIR/"}"
+	else
+		printf '%s\n' "$p"
+	fi
+}
+
+# Filter stdin (one absolute path per line) to those at or under NEEDLE.
+filter_within() {
+	local needle="$1"
+	if [[ -d "$needle" ]]; then
+		local prefix="${needle%/}/"
+		awk -v p="$needle" -v pre="$prefix" '$0==p || index($0, pre)==1'
+	else
+		awk -v p="$needle" '$0==p'
+	fi
+}
+
+# Crypt entries as JSON: { "<id>": { dst, targetPath, ... }, ... }
+crypt_entries_json() {
+	chezmoi data --format=json | jq '.crypt // {}'
+}
+
+# Absolute target paths of all crypt-managed files, sorted.
+crypt_target_paths() {
+	crypt_entries_json | jq -r '.[].targetPath' \
+		| awk -v h="$HOME_DIR/" 'NF{print h $0}' | LC_ALL=C sort -u
+}
+
+# Find crypt id for an absolute target path. Empty if not crypt-managed.
+crypt_id_for_target() {
+	local tgt="$1"
+	local rel; rel="$(home_rel "$tgt")"
+	crypt_entries_json | jq -r --arg p "$rel" '
+		to_entries[] | select(.value.targetPath == $p) | .key
+	' | head -n1
+}
+
+# True iff a source basename indicates encrypted content (encrypted_ prefix
+# anywhere in the leading chezmoi-prefix run).
+is_encrypted_source() {
+	local src="$1"
+	local base; base="$(basename "$src")"
+	[[ "$base" =~ ^([a-z]+_)*encrypted_ ]]
+}
+
+new_crypt_id() {
+	local id
+	while :; do
+		id="$(openssl rand -hex 4)"
+		[[ ! -e "$CRYPT_DIR/$id.age" && ! -e "$CRYPT_DIR/$id.yaml.age" ]] && {
+			printf '%s\n' "$id"
+			return
+		}
+	done
+}
+
+decrypt_yaml() {
+	command chezmoi --use-builtin-age=on decrypt "$1"
+}
+
+extract_dst() {
+	# Pull the dst value from decrypted yaml text. Handles unquoted and
+	# double-quoted values.
+	awk '
+		/^dst:[[:space:]]/ {
+			sub(/^dst:[[:space:]]*/, "")
+			gsub(/^"|"$/, "")
+			print
+			exit
+		}' <<<"$1"
+}
+
+# Rewrite the dst line in yaml_text in place, preserving other fields.
+replace_dst() {
+	local yaml_text="$1" new_dst="$2"
+	awk -v new="$new_dst" '/^dst:/ {print "dst: " new; next} {print}' <<<"$yaml_text"
+}
+
+encrypt_yaml_to() {
+	local out="$1" yaml="$2"
+	# Ensure the payload ends with a newline so the hook's `read` loop sees
+	# the final line.
+	[[ "$yaml" == *$'\n' ]] || yaml="${yaml}"$'\n'
+	printf '%s' "$yaml" | command chezmoi encrypt --output "$out"
+}
+
+# Remove a literal line from .git/info/exclude.
+strip_exclude_line() {
+	local line="$1"
+	local exclude="$SOURCE_DIR/.git/info/exclude"
+	[[ -f "$exclude" ]] || return 0
+	local tmp; tmp="$(mktemp)"
+	grep -vxF -- "$line" "$exclude" >"$tmp" || true
+	mv "$tmp" "$exclude"
+}
+
+# Trigger the hook by running a no-op chezmoi command.
+refresh() {
+	command chezmoi status >/dev/null 2>&1 || true
+}
+
+# ----------------------------------------------------------------------------
+# commands
+# ----------------------------------------------------------------------------
+
+cmd_list_encrypted() {
+	local needle="${1:-$(default_path)}"
+	needle="$(abs_path "$needle")"
+	crypt_target_paths | filter_within "$needle"
+}
+
+cmd_list_clear() {
+	local needle="${1:-$(default_path)}"
+	needle="$(abs_path "$needle")"
+
+	local crypt_set all_files encrypted_set
+	crypt_set="$(crypt_target_paths)"
+	all_files="$(command chezmoi managed --include=files --path-style=absolute | LC_ALL=C sort -u)"
+	encrypted_set="$(command chezmoi managed --include=encrypted --path-style=absolute | LC_ALL=C sort -u)"
+
+	# Clear-path managed = all - crypt
+	# Of those, the ones in encrypted_set get the lock marker.
+	local clear_set
+	clear_set="$(LC_ALL=C comm -23 <(printf '%s\n' "$all_files") <(printf '%s\n' "$crypt_set"))"
+
+	printf '%s\n' "$clear_set" | filter_within "$needle" | awk -v enc="$encrypted_set" -v m="$ENCRYPTED_MARKER" '
+		BEGIN {
+			n = split(enc, parts, "\n")
+			for (i = 1; i <= n; i++) E[parts[i]] = 1
+		}
+		NF {
+			if ($0 in E) print m $0
+			else print
+		}'
+}
+
+cmd_mv() {
+	if (( $# < 2 )); then
+		echo "Usage: $PROGRAM mv SRC... DST" >&2
+		exit 1
+	fi
+	local dst_arg="${@: -1}"
+	local srcs=("${@:1:$#-1}")
+	local dst_abs; dst_abs="$(abs_path "$dst_arg")"
+	dst_abs="${dst_abs%/}"
+	[[ -z "$dst_abs" ]] && dst_abs="/"
+	local is_dir=0
+	[[ -d "$dst_abs" ]] && is_dir=1
+	# Trailing slash on a non-existent destination is an error (matches mv).
+	if [[ "$dst_arg" == */ ]] && (( is_dir != 1 )); then
+		echo "Error: $dst_arg: not an existing directory" >&2
+		exit 1
+	fi
+	if (( ${#srcs[@]} > 1 )) && (( is_dir != 1 )); then
+		echo "Error: when moving multiple sources, DST must be an existing directory" >&2
+		exit 1
+	fi
+
+	local changed=0
+	for src_arg in "${srcs[@]}"; do
+		local src_abs; src_abs="$(abs_path "$src_arg")"
+		local new_target
+		if (( is_dir == 1 )); then
+			new_target="$dst_abs/$(basename "$src_abs")"
+		else
+			new_target="$dst_abs"
+		fi
+		if mv_one "$src_abs" "$new_target"; then
+			changed=1
+		fi
+	done
+	(( changed )) && refresh
+}
+
+mv_one() {
+	local old_target="$1" new_target="$2"
+	local id; id="$(crypt_id_for_target "$old_target")"
+	if [[ -z "$id" ]]; then
+		echo "Error: $old_target is not managed by the crypt scheme; skipping" >&2
+		return 1
+	fi
+
+	# Move the target file first; on failure (e.g. dest dir missing) leave
+	# all metadata untouched.
+	mv -- "$old_target" "$new_target" || return 1
+
+	# Then rewrite dst in the crypt yaml.
+	local yaml; yaml="$(decrypt_yaml "$CRYPT_DIR/$id.yaml.age")"
+	local old_dst; old_dst="$(extract_dst "$yaml")"
+	local new_dst; new_dst="$(derive_new_dst "$old_dst" "$old_target" "$new_target")"
+	encrypt_yaml_to "$CRYPT_DIR/$id.yaml.age" "$(replace_dst "$yaml" "$new_dst")"
+
+	echo "$old_target -> $new_target  (id=$id, dst $old_dst -> $new_dst)"
+}
+
+# Apply chezmoi's prefix conventions to a new target path, preserving both
+# the leaf prefix run (e.g. encrypted_) and any trailing suffix (e.g. .age)
+# from the old dst leaf.
+derive_new_dst() {
+	local old_dst="$1" old_target="$2" new_target="$3"
+	local new_rel; new_rel="$(home_rel "$new_target")"
+
+	# Compute old leaf and its source-side form (with dot_ for dotfile).
+	local old_dst_leaf="${old_dst##*/}"
+	local old_target_leaf="${old_target##*/}"
+	local old_target_search="$old_target_leaf"
+	[[ "$old_target_search" == .* ]] && old_target_search="dot_${old_target_search#.}"
+
+	# Split old leaf as: <prefix_run><old_target_search><suffix_run>.
+	local prefix_run="" suffix_run=""
+	if [[ "$old_dst_leaf" == *"$old_target_search"* ]]; then
+		prefix_run="${old_dst_leaf%%"$old_target_search"*}"
+		suffix_run="${old_dst_leaf##*"$old_target_search"}"
+	fi
+
+	# Build new source-relative path.
+	local IFS=/
+	read -ra parts <<<"$new_rel"
+	local n=${#parts[@]} i p result=""
+	for (( i = 0; i < n - 1; i++ )); do
+		p="${parts[i]}"
+		[[ "$p" == .* ]] && p="dot_${p#.}"
+		result="${result:+$result/}$p"
+	done
+
+	local leaf="${parts[$((n - 1))]}"
+	local leaf_src="$leaf"
+	[[ "$leaf_src" == .* ]] && leaf_src="dot_${leaf_src#.}"
+	result="${result:+$result/}${prefix_run}${leaf_src}${suffix_run}"
+	printf '/%s\n' "$result"
+}
+
+cmd_forget() {
+	local changed=0
+	for file in "$@"; do
+		local abs; abs="$(abs_path "$file")"
+		local id; id="$(crypt_id_for_target "$abs")"
+		if [[ -z "$id" ]]; then
+			echo "Warning: $abs is not managed by the crypt scheme; skipping" >&2
+			continue
+		fi
+		rm -f "$CRYPT_DIR/$id.age" "$CRYPT_DIR/$id.yaml.age"
+		echo "$abs: forgotten (crypt id=$id removed)"
+		changed=1
+	done
+	(( changed )) && refresh
+}
+
+cmd_use_existing_path() {
+	_alt_init
+	local changed=0
+	for file in "$@"; do
+		local abs; abs="$(abs_path "$file")"
+		local id; id="$(crypt_id_for_target "$abs")"
+		if [[ -z "$id" ]]; then
+			echo "Warning: $abs is not managed by the crypt scheme; skipping" >&2
+			continue
+		fi
+
+		local yaml; yaml="$(decrypt_yaml "$CRYPT_DIR/$id.yaml.age")"
+		local old_dst; old_dst="$(extract_dst "$yaml")"
+		local rel="${old_dst#/}"
+
+		local found
+		found="$(alt_path "file" "$rel" 2>/dev/null || true)"
+		if [[ -z "$found" ]]; then
+			echo "$abs: no existing source path found; skipping" >&2
+			continue
+		fi
+		local new_dst="/${found#"$SOURCE_DIR/"}"
+		if [[ "$new_dst" == "$old_dst" ]]; then
+			echo "$abs: dst already matches existing path ($new_dst)"
+			continue
+		fi
+		local new_yaml; new_yaml="$(replace_dst "$yaml" "$new_dst")"
+		encrypt_yaml_to "$CRYPT_DIR/$id.yaml.age" "$new_yaml"
+		echo "$abs: dst updated $old_dst -> $new_dst"
+		changed=1
+	done
+	(( changed )) && refresh
+}
+
+cmd_to_encrypted_path() {
+	for file in "$@"; do
+		local abs; abs="$(abs_path "$file")"
+		local id; id="$(crypt_id_for_target "$abs")"
+		if [[ -n "$id" ]]; then
+			echo "$abs: already uses crypt scheme (id=$id)"
+			continue
+		fi
+
+		# Step 1: ensure file is managed and encrypted (clear path).
+		local src
+		if src="$(command chezmoi source-path "$abs" 2>/dev/null)"; then
+			if ! is_encrypted_source "$src"; then
+				command chezmoi forget --force "$abs"
+				command chezmoi add --encrypt "$abs"
+				src="$(command chezmoi source-path "$abs")"
+			fi
+		else
+			command chezmoi add --encrypt "$abs"
+			src="$(command chezmoi source-path "$abs")"
+		fi
+
+		# Step 2: move into crypt/<new_id>.age + crypt/<new_id>.yaml.age.
+		local src_rel="${src#"$SOURCE_DIR/"}"
+		local new_id; new_id="$(new_crypt_id)"
+		cp "$src" "$CRYPT_DIR/$new_id.age"
+		encrypt_yaml_to "$CRYPT_DIR/$new_id.yaml.age" "$(printf 'dst: /%s\n' "$src_rel")"
+
+		# Step 3: remove the chezmoi-created source file and any now-empty
+		# ancestor dirs, so the hook can re-materialize them as hook-owned
+		# (hidden from git) on the next run.
+		rm "$src"
+		local d; d="$(dirname "$src")"
+		while [[ "$d" == "$SOURCE_DIR"/?* ]]; do
+			rmdir "$d" 2>/dev/null || break
+			d="$(dirname "$d")"
+		done
+
+		echo "$abs: converted to crypt scheme (id=$new_id, dst=/$src_rel)"
+	done
+	refresh
+}
+
+cmd_to_encrypted() {
+	for file in "$@"; do
+		local abs; abs="$(abs_path "$file")"
+		local id; id="$(crypt_id_for_target "$abs")"
+		if [[ -n "$id" ]]; then
+			# crypt-scheme -> clear-path encrypted: the hardlink at src IS
+			# already an age-encrypted file. Remove crypt entries and strip
+			# the file's exclude line so the hook's cleanup leaves src alone.
+			local src; src="$(command chezmoi source-path "$abs")"
+			local src_rel="${src#"$SOURCE_DIR/"}"
+			rm -f "$CRYPT_DIR/$id.yaml.age" "$CRYPT_DIR/$id.age"
+			strip_exclude_line "/$src_rel"
+			echo "$abs: converted from crypt scheme to encrypted clear-path"
+			continue
+		fi
+
+		local src
+		if src="$(command chezmoi source-path "$abs" 2>/dev/null)"; then
+			if is_encrypted_source "$src"; then
+				echo "$abs: already managed encrypted with clear path"
+				continue
+			fi
+			command chezmoi forget --force "$abs"
+			command chezmoi add --encrypt "$abs"
+			echo "$abs: converted from unencrypted to encrypted clear-path"
+		else
+			command chezmoi add --encrypt "$abs"
+			echo "$abs: added as encrypted clear-path"
+		fi
+	done
+	refresh
+}
+
+cmd_to_unencrypted() {
+	for file in "$@"; do
+		local abs; abs="$(abs_path "$file")"
+		local id; id="$(crypt_id_for_target "$abs")"
+		if [[ -n "$id" ]]; then
+			# crypt-scheme: detach hardlink (so the standalone src is the
+			# only copy of the encrypted blob), then forget+add unencrypted.
+			local src; src="$(command chezmoi source-path "$abs")"
+			local src_rel="${src#"$SOURCE_DIR/"}"
+			rm -f "$CRYPT_DIR/$id.yaml.age" "$CRYPT_DIR/$id.age"
+			strip_exclude_line "/$src_rel"
+			command chezmoi forget --force "$abs"
+			command chezmoi add "$abs"
+			echo "$abs: converted from crypt scheme to unencrypted"
+			continue
+		fi
+
+		local src
+		if src="$(command chezmoi source-path "$abs" 2>/dev/null)"; then
+			if is_encrypted_source "$src"; then
+				command chezmoi forget --force "$abs"
+				command chezmoi add "$abs"
+				echo "$abs: converted from encrypted clear-path to unencrypted"
+			else
+				echo "$abs: already managed unencrypted"
+			fi
+		else
+			command chezmoi add "$abs"
+			echo "$abs: added as unencrypted"
+		fi
+	done
+	refresh
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+main() {
+	local cmd="${1:-}"
+	case "$cmd" in
+		''|-h|--help) usage; exit 0 ;;
+		help)
+			if [[ $# -ge 2 ]]; then
+				help_for "$2"
+			else
+				usage
+			fi
+			exit 0
+			;;
+	esac
+	shift
+	# Per-command help: `<cmd> -h|--help`.
+	for arg in "$@"; do
+		case "$arg" in
+			-h|--help) help_for "$cmd"; exit 0 ;;
+		esac
+	done
+	_init
+	case "$cmd" in
+		list-encrypted)    cmd_list_encrypted "$@" ;;
+		list-clear)        cmd_list_clear "$@" ;;
+		mv)                cmd_mv "$@" ;;
+		forget)            cmd_forget "$@" ;;
+		use-existing-path) cmd_use_existing_path "$@" ;;
+		to-encrypted-path) cmd_to_encrypted_path "$@" ;;
+		to-encrypted)      cmd_to_encrypted "$@" ;;
+		to-unencrypted)    cmd_to_unencrypted "$@" ;;
+		*) echo "Unknown command: $cmd" >&2; usage >&2; exit 1 ;;
+	esac
+}
+
+main "$@"

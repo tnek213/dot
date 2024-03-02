@@ -1,0 +1,10 @@
+[Unit]
+Description=Retry aictx-tidy through the day until it gets a clean slot
+
+[Timer]
+OnCalendar=*-*-* 09..21:00/30:00
+Persistent=true
+Unit=aictx-tidy.service
+
+[Install]
+WantedBy=timers.target

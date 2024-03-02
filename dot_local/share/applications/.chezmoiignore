@@ -1,0 +1,4 @@
+{{- $beeper := stat (joinPath .chezmoi.homeDir ".local/lib/appimage/Beeper.AppImage") -}}
+{{- if not $beeper -}}
+beeper.desktop
+{{- end -}}

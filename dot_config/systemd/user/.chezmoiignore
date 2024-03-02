@@ -1,0 +1,16 @@
+{{- $st := stat (joinPath .chezmoi.homeDir ".dropbox-dist") -}}
+{{- if not (and $st $st.isDir) -}}
+dropbox.service
+{{- end -}}
+{{- if not (lookPath "obsidian") -}}
+obstend.service
+obstend.timer
+{{- end -}}
+{{- if not (lookPath "claude-project") -}}
+aictx-tidy.service
+aictx-tidy.timer
+{{- end -}}
+{{- if not (lookPath "mbsync") -}}
+mbsync@.service
+mbsync@.timer
+{{- end -}}

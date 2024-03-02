@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Beeper
+Exec=/home/kent/.local/lib/appimage/Beeper.AppImage %U
+Icon=beeper
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupWMClass=Beeper

@@ -1,0 +1,42 @@
+[Unit]
+Description=Tidy ~/Documents/aictx slug names (once per day, when no claude is running)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/aictx
+
+# Skip if today's run already happened.
+ExecCondition=/bin/sh -c '! test -e %S/aictx-tidy/last-run-$(date +%%F)'
+
+# Skip if any 'claude' process is alive for this user — interactive Claude
+# Code sessions must not be disturbed by a parallel headless run.
+ExecCondition=/bin/sh -c '! pgrep -u %U -fi "\\bclaude\\b" >/dev/null'
+
+# Claude needs network connectivity; wait briefly for NetworkManager.
+ExecCondition=/usr/bin/nm-online -q --timeout=30
+
+# StateDirectory creates %S/aictx-tidy with correct ownership before namespacing,
+# so the ReadWritePaths entry below resolves.
+StateDirectory=aictx-tidy
+
+# Daily runner: shell-side eligibility filter, then claude with focused prompt.
+# Path-scoped Edit comes from ~/Documents/aictx/.claude/settings.json.
+ExecStart=/bin/sh -c 'exec %h/.config/systemd/user/aictx-tidy-uses/run.sh %S/aictx-tidy > %S/aictx-tidy/current.log 2>&1'
+
+# Extract this run's renames into renames.log, prune entries older than 30 days, then fold current.log into last-run.log.
+ExecStartPost=%h/.config/systemd/user/aictx-tidy-uses/post.sh %S/aictx-tidy
+
+# Drop today's marker and prune older ones (keep the logs).
+ExecStartPost=/bin/sh -c 'touch %S/aictx-tidy/last-run-$(date +%%F) && find %S/aictx-tidy -maxdepth 1 -name "last-run-*" ! -name "last-run-$(date +%%F)" ! -name "last-run.log" -delete'
+
+# Sandbox: lock everything down, then unlock the few paths the job needs.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Documents/aictx %h/.claude %S/aictx-tidy
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

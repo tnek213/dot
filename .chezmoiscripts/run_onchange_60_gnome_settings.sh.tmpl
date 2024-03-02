@@ -1,0 +1,24 @@
+{{- if (lookPath "gsettings") -}}
+
+#!/usr/bin/env sh
+
+set -eu
+
+gset() {
+  schema="$1"
+  key="$2"
+  want="$3"
+
+  cur="$(gsettings get "$schema" "$key" 2>/dev/null || true)"
+  # Skip if the key doesn't exist.
+  [ -n "$cur" ] || return 0
+
+  if [ "$cur" != "'$want'" ]; then
+    gsettings set "$schema" "$key" "$want"
+  fi
+}
+
+gset org.gnome.system.locale region sv_SE.utf8
+gset org.gnome.desktop.interface clock-format '24h'
+
+{{- end -}}
