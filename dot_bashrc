@@ -1,0 +1,117 @@
+# shellcheck shell=bash
+
+# shellcheck disable=SC1090,SC2155
+
+# Do not execute this script if it's not an interactive shell
+[[ $- != *i* ]] && return
+
+__BASHRC_DEBUG_OUTPUT() {
+    if [ -z "$__BASHRC_START_TIME_MS" ]; then
+        __BASHRC_START_TIME_MS="$(($(date +%s%N) / 1000000))"
+    fi
+
+    if [ -n "$__BASHRC_DEBUG" ]; then
+        __BASHRC_TIME_MS=$((($(date +%s%N) / 1000000) - __BASHRC_START_TIME_MS))
+
+        printf "%04d: %s\n" "$__BASHRC_TIME_MS" "$1" 1>&2
+    fi
+}
+
+___BASHRC_GET_GUARD_ID() {
+    echo "___BASHRC_${1%.*}" | tr ' /' '__' | tr '[:lower:]' '[:upper:]' | tr -d -c '[:upper:]_'
+}
+
+__BASHRC_SOURCE() {
+    local GUARD_ID="$(___BASHRC_GET_GUARD_ID "$1")"
+    __BASHRC_DEBUG_OUTPUT "'$1' has GUARD_ID '$GUARD_ID'"
+
+    # Indirect lookup of the variable name inside GUARD_ID
+    if [ -z "${!GUARD_ID}" ]; then
+        # Mark as sourced immediately to prevent endless dependency loops
+        eval "$GUARD_ID=sourced"
+
+        __BASHRC_DEBUG_OUTPUT "Sourcing '$1'"
+        source "$1"
+    else
+        __BASHRC_DEBUG_OUTPUT "Not sourcing '$1' as it's already sourced"
+    fi
+}
+
+___BASHRC_CACHING=()
+
+__BASHRC_SOURCE_COMMAND_OUTPUT() {
+    local KEY_FILE="$1"
+
+    [[ ! -e "$KEY_FILE" ]] && KEY_FILE="$(which "$KEY_FILE")"
+
+    if [ -z "$KEY_FILE" ]; then
+        __BASHRC_DEBUG_OUTPUT "No key file found for '$1'"
+        return
+    fi
+
+    local CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/bashrc
+    mkdir -p "$CACHE"
+
+    # turn all parameters into a single string with spaces
+    local COMPLETE_LINE="$*"
+
+    local CACHED="$CACHE/$(___BASHRC_GET_GUARD_ID "$COMPLETE_LINE")$(stat -c %Y "$KEY_FILE")"
+
+    if [ ! -f "$CACHED" ]; then
+        __BASHRC_DEBUG_OUTPUT "Executing '$COMPLETE_LINE' and caching the output to '$CACHED'"
+        ___BASHRC_CACHING+=("$CACHED")
+        (eval "$COMPLETE_LINE" >"$CACHED" &)
+    else
+        __BASHRC_DEBUG_OUTPUT "Using cached command output for '$KEY_FILE' from '$CACHED'"
+        source "$CACHED"
+    fi
+}
+
+__BASHRC_DEBUG_OUTPUT "Sourcing scripts!"
+
+___BASHRC_MAX_TIME_TAKEN_MS=0
+for __BASHRC_SCRIPT in "$HOME/.bashrc.d/"*; do
+    ___BASHRC_TIME_BEFORE_MS="$(($(date +%s%N) / 1000000))"
+    __BASHRC_SOURCE "${__BASHRC_SCRIPT}"
+    ___BASHRC_TIME_AFTER_MS="$(($(date +%s%N) / 1000000))"
+
+    ___BASHRC_TIME_TAKEN_MS=$((___BASHRC_TIME_AFTER_MS - ___BASHRC_TIME_BEFORE_MS))
+
+    if ((___BASHRC_MAX_TIME_TAKEN_MS < ___BASHRC_TIME_TAKEN_MS)); then
+        ___BASHRC_MAX_TIME_TAKEN_MS=$___BASHRC_TIME_TAKEN_MS
+        ___SLOWEST_SCRIPT="$__BASHRC_SCRIPT"
+    fi
+done
+
+__BASHRC_DEBUG_OUTPUT "Done sourcing scripts!"
+
+wait # for background cache commands to finish
+
+if [ -n "$__BASHRC_CACHED" ]; then
+    __BASHRC_DEBUG_OUTPUT "Sourcing cached scripts!"
+
+    for __BASHRC_CACHED in "${___BASHRC_CACHING[@]}"; do
+        __BASHRC_DEBUG_OUTPUT "Sourcing cached script '$__BASHRC_CACHED'"
+
+        ___BASHRC_TIME_BEFORE_MS="$(($(date +%s%N) / 1000000))"
+        source "$__BASHRC_CACHED"
+        ___BASHRC_TIME_AFTER_MS="$(($(date +%s%N) / 1000000))"
+
+        ___BASHRC_TIME_TAKEN_MS=$((___BASHRC_TIME_AFTER_MS - ___BASHRC_TIME_BEFORE_MS))
+
+        if ((___BASHRC_MAX_TIME_TAKEN_MS < ___BASHRC_TIME_TAKEN_MS)); then
+            ___BASHRC_MAX_TIME_TAKEN_MS=$___BASHRC_TIME_TAKEN_MS
+            ___BASHRC_SLOWEST_SCRIPT="$__BASHRC_SCRIPT"
+        fi
+    done
+fi
+
+__BASHRC_DEBUG_OUTPUT "Slowest script was '$___BASHRC_SLOWEST_SCRIPT' at $___BASHRC_MAX_TIME_TAKEN_MS ms."
+
+if [ -z "$__BASHRC_DEBUG_KEEPVARS" ]; then
+    __BASHRC_DEBUG_OUTPUT "Unsetting variables set by the script"
+    # Unset all variables set by the script just to source the initial scripts
+    eval 'unset $(compgen -v | grep -E ^___?BASHRC_)'
+else
+    __BASHRC_DEBUG_OUTPUT "Keeping variables set by the script as \$__BASHRC_DEBUG_KEEPVARS was set"
+fi
