@@ -1,0 +1,77 @@
+# shellcheck shell=bash
+
+# shellcheck disable=SC1090,SC2155
+
+# If not running interactively, don't do anything
+[[ $- != *i* ]] && return
+
+# Function to print debug output if $__BASHRC_DEBUG is set
+__BASHRC_DEBUG_OUTPUT() {
+    if [ -n "$__BASHRC_DEBUG" ]; then
+        echo "$1" 1>&2
+    fi
+}
+
+# Function to calculate the ID of a script file
+__BASHRC_ID() {
+    echo "___BASHRC_$(basename "${1%.*}" | tr -d $'\n')" | tr '[:lower:]' '[:upper:]' | tr -c '[:upper:]' '_'
+}
+
+# Function to check if the script is in the correct phase
+__BASHRC_IS_CORRECT_PHASE() {
+    local PREFIX="$__BASHRC_PHASE"
+    if [ -n "$PREFIX" ]; then
+        PREFIX+="-"
+    fi
+    PREFIX="^$PREFIX."
+
+    [[ "$(basename "$__BASHRC_SCRIPT")" =~ $PREFIX ]]
+}
+
+__BASHRC_SOURCE() {
+    __BASHRC_DEBUG_OUTPUT "Trying to source '$1'"
+    if ! __BASHRC_IS_CORRECT_PHASE "$1"; then
+        echo "Warning: Skipping sourcing of '$1' as it's not in the correct phase!" 1>&2
+        return
+    fi
+
+    # ID contains a unique variable name used as a "guard" to not source the same file twice.
+    local ID="$(__BASHRC_ID "$1")"
+    # Indirect lookup of the variable name inside ID
+    if [ -z "${!ID}" ]; then
+        # We set it as "sourced" right away to avoid an infinite look in case of __BASHRC_SOURCE "source"-cycles where two files are marked as needing each other
+        eval "$ID=sourced"
+
+        __BASHRC_DEBUG_OUTPUT "Sourcing '$1'"
+        source "$1"
+    else
+        __BASHRC_DEBUG_OUTPUT "Skipping sourcing of '$1' as it's already sourced"
+    fi
+}
+
+
+# Go through the separate phases pre, "regular" and post
+for __BASHRC_PHASE in pre '' post; do
+    __BASHRC_DEBUG_OUTPUT "Sourcing ${__BASHRC_PHASE:-regular} scripts"
+    for __BASHRC_SCRIPT in "$HOME/.bashrc.d/"*; do
+        # Skip non-matching phases
+        __BASHRC_IS_CORRECT_PHASE "$__BASHRC_SCRIPT" || continue
+
+        if [ ! -f "${__BASHRC_SCRIPT}" ]; then
+            echo "Warning: Skipping '$__BASHRC_SCRIPT' as it's not a regular file!" 1>&2
+            continue
+        fi
+
+        __BASHRC_SOURCE "${__BASHRC_SCRIPT}"
+    done
+done
+
+__BASHRC_DEBUG_OUTPUT "Done sourcing scripts!"
+
+if [ -z "$__BASHRC_DEBUG_KEEPVARS" ]; then
+    __BASHRC_DEBUG_OUTPUT "Unsetting variables set by the script"
+    # Unset all variables set by the script just to source the initial scripts
+    eval 'unset $(compgen -v | grep -E ^___?BASHRC_)'
+else
+    __BASHRC_DEBUG_OUTPUT "Keeping variables set by the script as $__BASHRC_DEBUG_KEEPVARS was set"
+fi

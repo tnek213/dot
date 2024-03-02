@@ -1,0 +1,6 @@
+[user]
+name = Kent Larsson
+email = kent@c8.se
+
+[core]
+sshCommand = ssh -i ~/.ssh/id_ed25519
