@@ -1,0 +1,206 @@
+# shellcheck shell=bash
+
+# shellcheck disable=SC1090,SC2155
+
+# Do not execute this script if it's not an interactive shell
+[[ $- != *i* ]] && return
+
+__BASHRC_DEBUG_OUTPUT() {
+    if [ -z "$__BASHRC_START_TIME_MS" ]; then
+        __BASHRC_START_TIME_MS="$(($(date +%s%N) / 1000000))"
+    fi
+
+    if [ -n "$__BASHRC_DEBUG" ]; then
+        __BASHRC_TIME_MS=$((($(date +%s%N) / 1000000) - __BASHRC_START_TIME_MS))
+
+        printf "%04d: %s\n" "$__BASHRC_TIME_MS" "$1" 1>&2
+    fi
+}
+
+export -f __BASHRC_DEBUG_OUTPUT
+
+___BASHRC_GET_GUARD_ID() {
+    echo "___BASHRC_${1%.*}" | tr ' /' '__' | tr '[:lower:]' '[:upper:]' | tr -d -c '[:upper:]_'
+}
+
+__BASHRC_SOURCE() {
+    local GUARD_ID="$(___BASHRC_GET_GUARD_ID "$1")"
+    __BASHRC_DEBUG_OUTPUT "'$1' has GUARD_ID '$GUARD_ID'"
+
+    # Indirect lookup of the variable name inside GUARD_ID
+    if [ -z "${!GUARD_ID}" ]; then
+        if [ ! -f "$1" ]; then
+            __BASHRC_DEBUG_OUTPUT "Not sourcing '$1' as it does not exist"
+            return
+        fi
+        # Mark as sourced immediately to prevent endless dependency loops
+        eval "$GUARD_ID=sourced"
+
+        __BASHRC_DEBUG_OUTPUT "Sourcing '$1'"
+        source "$1"
+    else
+        __BASHRC_DEBUG_OUTPUT "Not sourcing '$1' as it's already sourced"
+    fi
+}
+
+___BASHRC_CACHED_NOW=()
+___BASHRC_CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/bashrc
+mkdir -p "$___BASHRC_CACHE"
+___BASHRC_FOREGROUND_FILE="$___BASHRC_CACHE/foreground.$BASHPID.sh"
+
+__BASHRC_SOURCE_COMMAND_OUTPUT() {
+    local KEY_FILE="$1"
+
+    [[ ! -e "$KEY_FILE" ]] && KEY_FILE="$(command -v "$KEY_FILE")"
+
+    if [ -z "$KEY_FILE" ]; then
+        __BASHRC_DEBUG_OUTPUT "No key file found for '$1'"
+        return
+    fi
+
+    # turn all parameters into a single string with spaces
+    local COMPLETE_LINE="$*"
+
+    local CACHED="$___BASHRC_CACHE/$(___BASHRC_GET_GUARD_ID "$COMPLETE_LINE")$(stat -c %Y "$KEY_FILE")"
+
+    local IN_PROGRESS="$CACHED.$BASHPID"
+
+    if [ -f "$CACHED" ]; then
+        __BASHRC_DEBUG_OUTPUT "Using cached command output for '$KEY_FILE' from '$CACHED'"
+        source "$CACHED"
+        return
+    fi
+
+    __BASHRC_DEBUG_OUTPUT "Executing '$COMPLETE_LINE' and caching the output to '$CACHED'"
+    ___BASHRC_CACHED_NOW+=("$CACHED")
+    (
+        eval "$COMPLETE_LINE" >"$IN_PROGRESS" &
+        PID=$!
+        # wait for max 5 seconds for the command to finish
+        for ((i = 0; i < 50; i++)); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE' finished successfully."
+                mv "$IN_PROGRESS" "$CACHED"
+                exit # is safe since this is a subshell
+            fi
+            sleep 0.1
+        done
+
+        rm -f "$IN_PROGRESS"
+
+        if kill -INT "$PID" 2>/dev/null; then
+            sleep 2 # give it some time to finish
+            if kill -0 "$PID" 2>/dev/null; then
+                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE' did not finish in time, killing it."
+                kill -KILL "$PID" 2>/dev/null || true
+            else
+                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE' finished after sending INT signal."
+            fi
+        fi
+
+        {
+            printf -v COMPLETE_LINE_QUOTED '%q ' "$@"
+            COMPLETE_LINE_QUOTED=${COMPLETE_LINE_QUOTED% }
+
+            printf "echo 'Re-running: %s'\n" "$COMPLETE_LINE_QUOTED"
+            echo "${COMPLETE_LINE_QUOTED} | tee '$IN_PROGRESS' && mv '$IN_PROGRESS' '$CACHED'"
+            echo "rm -f '$IN_PROGRESS'"
+        } >>"$___BASHRC_FOREGROUND_FILE"
+    ) &
+}
+
+___BASHRC_CLEAN_CACHE() (
+    cd "$___BASHRC_CACHE" 2>/dev/null || exit 0
+    shopt -s nullglob
+
+    NOW=$(date +%s)
+    DELETE_PIDS=
+    declare -A SEEN_COMMANDS
+
+    # shellcheck disable=SC2045
+    for FILE in $(ls -1t ___BASHRC_*); do
+        [[ -f $FILE ]] || continue
+
+        if [[ -z $DELETE_PIDS ]]; then
+            MTIME=$(stat -c %Y "$FILE")
+            ((NOW - MTIME >= 600)) && DELETE_PIDS=1
+        fi
+
+        # pid file
+        if [[ $FILE =~ [0-9]+\.[0-9]+$ ]]; then
+            [[ $DELETE_PIDS == 1 ]] && rm -f -- "$FILE"
+            continue
+        fi
+
+        # cache file
+        if [[ $FILE =~ ^([^0-9]+)[0-9]+$ ]]; then
+            COMMAND=${BASH_REMATCH[1]}
+            if [[ ${SEEN_COMMANDS[$COMMAND]} == 1 ]]; then
+                rm -f -- "$FILE"
+            else
+                SEEN_COMMANDS[$COMMAND]=1
+            fi
+        fi
+    done
+)
+
+__BASHRC_DEBUG_OUTPUT "Sourcing scripts!"
+
+___BASHRC_MAX_TIME_TAKEN_MS=0
+for __BASHRC_SCRIPT in "$HOME/.bashrc.d/"*; do
+    ___BASHRC_TIME_BEFORE_MS="$(($(date +%s%N) / 1000000))"
+    __BASHRC_SOURCE "${__BASHRC_SCRIPT}"
+    ___BASHRC_TIME_AFTER_MS="$(($(date +%s%N) / 1000000))"
+
+    ___BASHRC_TIME_TAKEN_MS=$((___BASHRC_TIME_AFTER_MS - ___BASHRC_TIME_BEFORE_MS))
+
+    if ((___BASHRC_MAX_TIME_TAKEN_MS < ___BASHRC_TIME_TAKEN_MS)); then
+        ___BASHRC_MAX_TIME_TAKEN_MS=$___BASHRC_TIME_TAKEN_MS
+        ___BASHRC_SLOWEST_SCRIPT="$__BASHRC_SCRIPT"
+    fi
+done
+
+__BASHRC_DEBUG_OUTPUT "Done sourcing scripts!"
+
+wait # for background cache commands to finish
+
+if [ -e "$___BASHRC_FOREGROUND_FILE" ]; then
+    __BASHRC_DEBUG_OUTPUT "Running foreground commands from '$___BASHRC_FOREGROUND_FILE'"
+
+    # shellcheck disable=SC1090
+    source "$___BASHRC_FOREGROUND_FILE"
+else
+    __BASHRC_DEBUG_OUTPUT "No foreground commands to run."
+fi
+
+rm -f "$___BASHRC_FOREGROUND_FILE"
+
+if ((${#___BASHRC_CACHED_NOW[@]})); then
+    __BASHRC_DEBUG_OUTPUT "Sourcing scripts cached now!"
+
+    ___BASHRC_CLEAN_CACHE &
+
+    for __BASHRC_CACHED in "${___BASHRC_CACHED_NOW[@]}"; do
+        __BASHRC_DEBUG_OUTPUT "Sourcing cached script '$__BASHRC_CACHED'"
+
+        source "$__BASHRC_CACHED"
+    done
+fi
+
+__BASHRC_DEBUG_OUTPUT "Slowest script was '$___BASHRC_SLOWEST_SCRIPT' at $___BASHRC_MAX_TIME_TAKEN_MS ms."
+
+if [ -z "$__BASHRC_DEBUG_KEEP" ]; then
+    __BASHRC_DEBUG_OUTPUT "Unsetting variables/functions set by the script"
+
+    # wipe vars / arrays / exported functions
+    vars=$(compgen -v | grep -E '^(BASH_FUNC___)?___?BASHRC_')
+    # shellcheck disable=SC2086
+    [ -n "$vars" ] && unset $vars
+
+    # wipe ordinary shell functions
+    fns=$(compgen -A function | grep -E '^___?BASHRC_')
+    # shellcheck disable=SC2086
+    [ -n "$fns" ] && unset -f $fns
+else
+    __BASHRC_DEBUG_OUTPUT "Keeping variables and functions set by the script as \$__BASHRC_DEBUG_KEEP was set"
+fi

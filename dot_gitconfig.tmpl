@@ -1,0 +1,48 @@
+[user]
+name = Kent Larsson
+email = kent.larsson@gmail.com
+
+{{ if (lookPath "interactive-rebase-tool") -}}
+
+[sequence]
+editor = interactive-rebase-tool
+
+{{ end -}}
+
+[init]
+defaultBranch = main
+
+[alias]
+hs = log --pretty='%C(yellow)%h %C(cyan)%cd %Cblue%aN%C(auto)%d %Creset%s' --graph --date=relative --date-order
+ira = rebase -i --root
+whatpush = diff --stat --cached origin/main
+resetauthor = commit --amend --reset-author --no-edit
+unstage = reset HEAD
+uncommit = "!git reset --soft HEAD~1 ; git restore --staged ."
+smashpush = "!git diff --quiet HEAD -- || ( git add . ; git commit --amend --no-edit ); git push --force-with-lease"
+search = "!git-reflogsearch"
+stash-specific = "stash push -m 'Saving specific files' --"
+stash-all = "!git restore --staged . && git stash push -u -k -m 'Saving staged and untracked files'"
+stash-all-incl-ignored = "!git restore --staged && git stash push -a -u -k -m 'Saving staged, untracked and ignored files'"
+
+[pull]
+rebase = true
+
+[push]
+autoSetupRemote = true
+
+[includeIf "hasconfig:remote.*.url:git@github.com:tnek213/**"]
+path = .gitconfig_github_personal
+
+#
+# src: {{ index .crypt "00e3c42b" "src" }}
+#
+
+[includeIf "hasconfig:{{ index .crypt "00e3c42b" "remoteUrlPattern1" }}"]
+path = {{ index .crypt "00e3c42b" "targetPath" }}
+
+[includeIf "hasconfig:{{ index .crypt "00e3c42b" "remoteUrlPattern2" }}"]
+path = {{ index .crypt "00e3c42b" "targetPath" }}
+
+[includeIf "hasconfig:{{ index .crypt "00e3c42b" "remoteUrlPattern3" }}"]
+path = {{ index .crypt "00e3c42b" "targetPath" }}

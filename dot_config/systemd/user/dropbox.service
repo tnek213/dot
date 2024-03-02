@@ -1,0 +1,13 @@
+[Unit]
+Description=Dropbox
+
+[Service]
+Type=simple
+Environment=DISPLAY=
+Environment=WAYLAND_DISPLAY=
+ExecStart=%h/.dropbox-dist/dropboxd
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

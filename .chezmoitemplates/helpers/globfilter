@@ -1,0 +1,39 @@
+{{- $g := get . "glob" -}}                 {{/* string | []string */}}
+{{- if not $g -}}
+  {{- fail "globfilter: missing required argument: glob" -}}
+{{- end -}}
+
+{{- $includeDirs := default false (get . "includeDirs") -}}
+{{- $re := default `^(.*)$` (get . "matchRegex") -}}
+
+{{- if not (and (regexMatch `\(` $re) (regexMatch `\)` $re)) -}}
+  {{- fail (printf "globfilter: matchRegex must contain a capture group '(...)', got: %q" $re) -}}
+{{- end -}}
+
+{{- $paths := list -}}
+{{- if kindIs "slice" $g -}}
+  {{- range $g -}}
+    {{- $paths = concat $paths (glob .) -}}
+  {{- end -}}
+{{- else if kindIs "string" $g -}}
+  {{- $paths = concat $paths (glob $g) -}}
+{{- else -}}
+  {{- fail (printf "globfilter: glob must be a string or list of strings, got %s" (typeOf $g)) -}}
+{{- end -}}
+{{- $paths = sortAlpha (uniq $paths) -}}
+
+{{- $hits := list -}}
+{{- range $paths -}}
+  {{- $st := stat . -}}
+  {{- if and $st (or $includeDirs (not $st.isDir)) -}}
+    {{- if regexMatch $re . -}}
+      {{- $m := regexReplaceAll $re . `$1` -}}
+      {{- $hits = concat $hits (list (printf "%s|%s" $m .)) -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+
+{{- $hits = sortAlpha (uniq $hits) -}}
+{{- range $hits -}}
+{{ . }}
+{{ end -}}
