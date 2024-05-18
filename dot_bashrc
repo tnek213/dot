@@ -5,6 +5,10 @@
 # If not running interactively, don't do anything
 [[ $- != *i* ]] && return
 
+# All functions and variables are prefixed with ___?BASHRC_ to avoid conflicts
+# with other scripts and for easy cleanup. Assignments that start with three
+# underscores are considered private and should not be used in other scripts.
+
 # Function to print debug output if $__BASHRC_DEBUG is set
 __BASHRC_DEBUG_OUTPUT() {
     if [ -n "$__BASHRC_DEBUG" ]; then
@@ -28,7 +32,8 @@ __BASHRC_IS_CORRECT_PHASE() {
     [[ "$(basename "$__BASHRC_SCRIPT")" =~ $PREFIX ]]
 }
 
-__BASHRC_SOURCE() {
+# Function to source a modular .bashrc.d script
+__BASHRC_DOT_D_PART_SOURCE() {
     __BASHRC_DEBUG_OUTPUT "Trying to source '$1'"
     if ! __BASHRC_IS_CORRECT_PHASE "$1"; then
         echo "Warning: Skipping sourcing of '$1' as it's not in the correct phase!" 1>&2
@@ -39,20 +44,54 @@ __BASHRC_SOURCE() {
     local ID="$(__BASHRC_ID "$1")"
     # Indirect lookup of the variable name inside ID
     if [ -z "${!ID}" ]; then
-        # We set it as "sourced" right away to avoid an infinite look in case of __BASHRC_SOURCE "source"-cycles where two files are marked as needing each other
+        # We set it as "sourced" right away to avoid an infinite look in case of __BASHRC_DOT_D_PART_SOURCE "source"-cycles where two files are marked as needing each other
         eval "$ID=sourced"
 
         __BASHRC_DEBUG_OUTPUT "Sourcing '$1'"
         source "$1"
     else
-        __BASHRC_DEBUG_OUTPUT "Skipping sourcing of '$1' as it's already sourced"
+        __BASHRC_DEBUG_OUTPUT "Not sourcing '$1' as it's already sourced"
     fi
 }
 
+___BASHRC_PHASE_PARALLEL_SOURCE_INIT() {
+    ___BASHRC_PHASE_PARALLEL_SOURCE_CONTENT='cat <(echo)'
+    __BASHRC_DEBUG_OUTPUT "Initialized parallel source scripts to '$___BASHRC_PHASE_PARALLEL_SOURCE_CONTENT'"
+}
+
+__BASHRC_PHASE_PARALLEL_SOURCE_ADD() {
+    if [ "$#" -eq 1 ] && [ -e "$1" ] && [ ! -x "$1" ]; then
+        set -- "cat $1"
+    fi
+
+    for ARG; do
+        ___BASHRC_PHASE_PARALLEL_SOURCE_CONTENT+=" <($ARG)"
+        __BASHRC_DEBUG_OUTPUT "Adding parallel source script '$ARG'"
+    done
+    __BASHRC_DEBUG_OUTPUT "Current parallel source scripts: '$___BASHRC_PHASE_PARALLEL_SOURCE_CONTENT'"
+}
+
+___BASHRC_PHASE_PARALLEL_SOURCE_APPLY() {
+    __BASHRC_DOT_D_VERSION="$(awk '{timesum+=$1} END {print timesum}' <(stat -c %Y "$HOME/.bashrc.d/"*))"
+
+    __BASHRC_BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
+
+    __BASHRC_CACHE_FILE="/tmp/.bashrc_cache_${USER}_${__BASHRC_PHASE:-main}_${__BASHRC_DOT_D_VERSION}_${__BASHRC_BOOT_ID}"
+    if [ -e "$__BASHRC_CACHE_FILE" ]; then
+        __BASHRC_DEBUG_OUTPUT "Sourcing detected cache file '$__BASHRC_CACHE_FILE' for increased performance"
+        source "$__BASHRC_CACHE_FILE"
+        return
+    fi
+
+    __BASHRC_DEBUG_OUTPUT "Applying parallel source scripts to the current shell $___BASHRC_PHASE_PARALLEL_SOURCE_CONTENT"
+    eval "$___BASHRC_PHASE_PARALLEL_SOURCE_CONTENT" >"$__BASHRC_CACHE_FILE"
+    __BASHRC_DEBUG_OUTPUT "Done applying parallel source scripts"
+}
 
 # Go through the separate phases pre, "regular" and post
 for __BASHRC_PHASE in pre '' post; do
     __BASHRC_DEBUG_OUTPUT "Sourcing ${__BASHRC_PHASE:-regular} scripts"
+    ___BASHRC_PHASE_PARALLEL_SOURCE_INIT
     for __BASHRC_SCRIPT in "$HOME/.bashrc.d/"*; do
         # Skip non-matching phases
         __BASHRC_IS_CORRECT_PHASE "$__BASHRC_SCRIPT" || continue
@@ -62,8 +101,9 @@ for __BASHRC_PHASE in pre '' post; do
             continue
         fi
 
-        __BASHRC_SOURCE "${__BASHRC_SCRIPT}"
+        __BASHRC_DOT_D_PART_SOURCE "${__BASHRC_SCRIPT}"
     done
+    ___BASHRC_PHASE_PARALLEL_SOURCE_APPLY
 done
 
 __BASHRC_DEBUG_OUTPUT "Done sourcing scripts!"
@@ -73,5 +113,5 @@ if [ -z "$__BASHRC_DEBUG_KEEPVARS" ]; then
     # Unset all variables set by the script just to source the initial scripts
     eval 'unset $(compgen -v | grep -E ^___?BASHRC_)'
 else
-    __BASHRC_DEBUG_OUTPUT "Keeping variables set by the script as $__BASHRC_DEBUG_KEEPVARS was set"
+    __BASHRC_DEBUG_OUTPUT "Keeping variables set by the script as \$__BASHRC_DEBUG_KEEPVARS was set"
 fi
