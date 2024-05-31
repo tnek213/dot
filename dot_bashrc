@@ -25,9 +25,9 @@ ___BASHRC_ID() {
 ___BASHRC_IS_CORRECT_PHASE() {
     local PREFIX="$__BASHRC_PHASE"
     if [ -n "$PREFIX" ]; then
-        PREFIX+="-"
+        PREFIX+="_"
     fi
-    PREFIX="^$PREFIX."
+    PREFIX="^$PREFIX"
 
     [[ "$(basename "$1")" =~ $PREFIX ]]
 }
