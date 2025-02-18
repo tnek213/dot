@@ -15,6 +15,7 @@ whatpush = diff --stat --cached origin/main
 resetauthor = commit --amend --reset-author --no-edit
 unstage = reset HEAD
 uncommit = reset --soft HEAD^
+smashpush = '!git add . ; git commit --amend --no-edit ; git push -f'
 
 [pull]
 rebase = true
