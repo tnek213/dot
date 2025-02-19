@@ -14,7 +14,7 @@ ira = rebase -i --root
 whatpush = diff --stat --cached origin/main
 resetauthor = commit --amend --reset-author --no-edit
 unstage = reset HEAD
-uncommit = reset --soft HEAD^
+uncommit = reset --soft HEAD~1
 smashpush = "!git add . ; git commit --amend --no-edit ; git push -f"
 
 [pull]
