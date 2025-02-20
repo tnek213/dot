@@ -79,7 +79,7 @@ for __BASHRC_SCRIPT in "$HOME/.bashrc.d/"*; do
 
     if ((___BASHRC_MAX_TIME_TAKEN_MS < ___BASHRC_TIME_TAKEN_MS)); then
         ___BASHRC_MAX_TIME_TAKEN_MS=$___BASHRC_TIME_TAKEN_MS
-        ___SLOWEST_SCRIPT="$__BASHRC_SCRIPT"
+        ___BASHRC_SLOWEST_SCRIPT="$__BASHRC_SCRIPT"
     fi
 done
 
