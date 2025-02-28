@@ -1,0 +1,79 @@
+{
+  "editor.fontFamily": "'IBM Plex Mono', 'Droid Sans Mono', 'monospace', monospace",
+  "editor.fontSize": 16,
+  "markdownlint.config": { "ol-prefix": false },
+  "security.workspace.trust.enabled": false,
+  "update.mode": "none",
+  "window.autoDetectHighContrast": false,
+  "window.titleBarStyle": "custom",
+  // common settings
+  "[dockerfile]": { "editor.defaultFormatter": "ms-azuretools.vscode-docker" },
+  "[javascript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[javascriptreact]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[json]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[jsonc]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[jsonl]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[markdown]": {
+    "editor.wordWrap": "bounded",
+    "editor.wordWrapColumn": 80,
+    "editor.tabSize": 4,
+    "editor.defaultFormatter": "yzhang.markdown-all-in-one"
+  },
+  "[powershell]": { "editor.defaultFormatter": "ms-vscode.powershell" },
+  "[python]": {
+    "editor.codeActionsOnSave": {
+      "source.organizeImports.ruff": "always"
+    },
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  "[shellscript]": {
+    "editor.defaultFormatter": "foxundermoon.shell-format",
+    "editor.insertSpaces": false
+  },
+  "[typescript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[typescriptreact]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "[yaml]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+  "editor.acceptSuggestionOnEnter": "off",
+  "editor.bracketPairColorization.independentColorPoolPerBracketType": true,
+  "editor.cursorStyle": "block",
+  "editor.defaultFormatter": "foxundermoon.shell-format",
+  "editor.formatOnSave": true,
+  "editor.minimap.enabled": false,
+  "explorer.confirmDelete": false,
+  "explorer.confirmDragAndDrop": false,
+  "explorer.excludeGitIgnore": true,
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "git.autofetch": true,
+  "git.confirmSync": false,
+  "git.enableSmartCommit": true,
+  "git.openRepositoryInParentFolders": "never",
+  "json.format.enable": false,
+  "markdown-preview-enhanced.previewTheme": "github-light.css",
+  "powershell.promptToUpdatePowerShell": false,
+  "window.zoomLevel": -1,
+  "python.createEnvironment.trigger": "off",
+  "typescript.updateImportsOnFileMove.enabled": "always",
+  "[dockercompose]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "workbench.colorTheme": "Ayu Mirage Bordered",
+  "markdown-preview-enhanced.codeBlockTheme": "auto.css",
+  "workbench.startupEditor": "none",
+  "editor.accessibilitySupport": "off",
+  "markdown-preview-enhanced.revealjsTheme": "none.css",
+  "githubPullRequests.pushBranch": "always",
+  "github.copilot.enable": {
+    "*": true,
+    "plaintext": false,
+    "markdown": false,
+    "scminput": false
+  },
+  "editor.renderWhitespace": "none",
+  "task.problemMatchers.neverPrompt": {
+    "shell": true
+  },
+  "window.confirmSaveUntitledWorkspace": false,
+  "window.customTitleBarVisibility": "windowed",
+  "files.autoSave": "afterDelay"
+}
