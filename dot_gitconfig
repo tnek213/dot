@@ -15,7 +15,11 @@ whatpush = diff --stat --cached origin/main
 resetauthor = commit --amend --reset-author --no-edit
 unstage = reset HEAD
 uncommit = "!git reset --soft HEAD~1 ; git restore --staged ."
-smashpush = "!git add . ; git commit --amend --no-edit ; git push --force-with-lease"
+smashpush = "!git diff --quiet HEAD -- || ( git add . ; git commit --amend --no-edit ); git push --force-with-lease"
+search = "!git-reflogsearch"
+stash-specific = 'stash push -m "Saving specific files' --"
+stash-all = "stash push -u -k -m 'Saving staged and untracked files'"
+stash-all-incl-ignored = "stash push -a -u -k -m 'Saving staged, untracked and ignored files'"
 
 [pull]
 rebase = true
