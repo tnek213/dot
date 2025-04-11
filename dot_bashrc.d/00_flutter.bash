@@ -1,1 +1,5 @@
-PATH="$PATH:/home/kent/.flutter/flutter"
+sdk=$USER/.flutter/flutter
+
+if [[ -d $sdk ]]; then
+	PATH="$PATH:$sdk"
+fi
