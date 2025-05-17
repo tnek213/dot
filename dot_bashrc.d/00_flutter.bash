@@ -1,5 +1,10 @@
-sdk=$USER/.flutter/flutter
+flutter=$USER/.flutter/flutter
+android=/home/kent/Android/Sdk
 
 if [[ -d $sdk ]]; then
-	PATH="$PATH:$sdk"
+	export PATH="$PATH:$sdk"
+fi
+
+if [[ -d $android ]]; then
+	export ANDROID_HOME=$android
 fi
