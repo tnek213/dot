@@ -1,5 +1,5 @@
 {
-  "editor.fontFamily": "'IBM Plex Mono', 'Droid Sans Mono', 'monospace', monospace",
+  "editor.fontFamily": "'Fira Code', 'IBM Plex Mono', 'Droid Sans Mono', 'monospace', monospace",
   "editor.fontSize": 16,
   "markdownlint.config": { "ol-prefix": false },
   "security.workspace.trust.enabled": false,
@@ -52,7 +52,7 @@
   "git.openRepositoryInParentFolders": "never",
   "github.copilot.enable": {
     "*": true,
-    "plaintext": false,
+    "plaintext": true,
     "markdown": false,
     "scminput": false
   },
@@ -70,5 +70,7 @@
   "window.zoomLevel": -1,
   "workbench.colorTheme": "Ayu Mirage Bordered",
   "workbench.startupEditor": "none",
-  "workbench.iconTheme": "ayu"
+  "workbench.iconTheme": "ayu",
+  "markdown-preview-enhanced.breakOnSingleNewLine": false,
+  "markdown-preview-enhanced.enableEmojiSyntax": false
 }
