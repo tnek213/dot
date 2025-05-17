@@ -3,6 +3,16 @@ if command -v gh &>/dev/null; then
     __BASHRC_SOURCE_COMMAND_OUTPUT gh copilot alias bash
     __BASHRC_SOURCE_COMMAND_OUTPUT gh copilot completion bash
     __BASHRC_SOURCE_COMMAND_OUTPUT gh classroom completion bash
+
+    if ! command -v node; then
+        gh() {
+            unset -f gh
+            nvm &>/dev/null
+
+            gh "$@"
+        }
+    fi
+
     # shellcheck disable=SC2046,SC2317
     gh-repo-create-TEMPL1() {
 

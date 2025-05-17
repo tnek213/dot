@@ -13,6 +13,12 @@ if [ -d "$HOME/.nvm" ]; then
         nvm "$@"
     }
 
+    npm() {
+        unset -f npm
+        nvm &>/dev/null
+        npm "$@"
+    }
+
     complete -o default -F __nvm nvm
 
     __nvm() {
