@@ -1,0 +1,47 @@
+# Top-level object: each key is a command name
+# Each command has:
+#   cmd: the executable to run
+#   package: the package name to install
+#   packager: the package manager to use (pip, npm, apt, etc.)
+
+python:
+  cmd: python3
+  description: Python 3 interpreter
+  source:
+    - apt:
+        - python3
+
+node:
+  cmd: node
+  description: Node.js runtime
+  source:
+    - apt:
+        - nodejs
+
+npm:
+  cmd: npm
+  description: Node.js package manager
+  source:
+    - apt:
+        - npm
+
+pip:
+  cmd: pip
+  description: Python package installer
+  source:
+    - apt:
+        - python3-pip
+
+nvim:
+  cmd: nvim
+  description: Neovim text editor
+  source:
+    - apt:
+        - neovim
+
+git-interactive-rebase-tool:
+  cmd: interactive-rebase-tool
+  description: Git interactive rebase tool
+  source:
+    - apt:
+        - git-interactive-rebase-tool

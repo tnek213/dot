@@ -10,6 +10,12 @@ script = "{{ .chezmoi.sourceDir }}/.hooks/hidden_filenames.bash"
 [hooks.edit.post]
 script = "{{ .chezmoi.sourceDir }}/.hooks/hidden_filenames.bash"
 
+{{- $gui := ne (or (stat "/usr/share/wayland-sessions") (stat "/usr/share/xsessions")) nil -}}
+
+[data]
+  gui = {{ $gui -}}
+
+
 {{ if (lookPath "code") -}}
 
 [edit]
@@ -17,8 +23,3 @@ command = "code"
 args = ["--wait"]
 
 {{ end -}}
-
-{{- $gui := ne (or (stat "/usr/share/wayland-sessions") (stat "/usr/share/xsessions")) nil -}}
-
-[data]
-  gui = {{ $gui -}}
