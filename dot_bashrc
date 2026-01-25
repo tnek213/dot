@@ -46,7 +46,11 @@ __BASHRC_SOURCE() {
 ___BASHRC_CACHED_NOW=()
 ___BASHRC_CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/bashrc
 mkdir -p "$___BASHRC_CACHE"
-___BASHRC_FOREGROUND_FILE="$___BASHRC_CACHE/foreground.$BASHPID.sh"
+___BASHRC_UNIQUE_PART="$USER.$BASHPID.$(date +%s%N)"
+___BASHRC_FOREGROUND_FILE="$___BASHRC_CACHE/foreground.$___BASHRC_UNIQUE_PART.sh"
+___BASHRC_FOREGROUND_FILE_LOCK_DIR="${___BASHRC_FOREGROUND_FILE}.lock"
+___BASHRC_BACKGROUND_PIDS_FILE="$___BASHRC_CACHE/background_pids.$___BASHRC_UNIQUE_PART"
+___BASHRC_BACKGROUND_PIDS_FILE_LOCK_DIR="${___BASHRC_BACKGROUND_PIDS_FILE}.lock"
 
 __BASHRC_SOURCE_COMMAND_OUTPUT() {
     local KEY_FILE="$1"
@@ -58,10 +62,13 @@ __BASHRC_SOURCE_COMMAND_OUTPUT() {
         return
     fi
 
-    # turn all parameters into a single string with spaces
-    local COMPLETE_LINE="$*"
+    local COMPLETE_LINE_QUOTED
 
-    local CACHED="$___BASHRC_CACHE/$(___BASHRC_GET_GUARD_ID "$COMPLETE_LINE")$(stat -c %Y "$KEY_FILE")"
+    # quote all arguments to form the complete command line and store it in COMPLETE_LINE_QUOTED
+    printf -v COMPLETE_LINE_QUOTED '%q ' "$@"
+    COMPLETE_LINE_QUOTED=${COMPLETE_LINE_QUOTED% }
+
+    local CACHED="$___BASHRC_CACHE/$(___BASHRC_GET_GUARD_ID "$COMPLETE_LINE_QUOTED")$(stat -c %Y "$KEY_FILE")"
 
     local IN_PROGRESS="$CACHED.$BASHPID"
 
@@ -71,42 +78,64 @@ __BASHRC_SOURCE_COMMAND_OUTPUT() {
         return
     fi
 
-    __BASHRC_DEBUG_OUTPUT "Executing '$COMPLETE_LINE' and caching the output to '$CACHED'"
+    __BASHRC_DEBUG_OUTPUT "Executing '$COMPLETE_LINE_QUOTED' and caching the output to '$CACHED'"
     ___BASHRC_CACHED_NOW+=("$CACHED")
     (
-        eval "$COMPLETE_LINE" >"$IN_PROGRESS" &
+        "$@" >"$IN_PROGRESS" 2>/dev/null &
         PID=$!
         # wait for max 5 seconds for the command to finish
         for ((i = 0; i < 50; i++)); do
             if ! kill -0 "$PID" 2>/dev/null; then
-                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE' finished successfully."
-                mv "$IN_PROGRESS" "$CACHED"
-                exit # is safe since this is a subshell
+                wait "$PID"
+                EXIT_CODE=$?
+                if ((EXIT_CODE == 0)); then
+                    __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE_QUOTED' finished successfully."
+                    mv "$IN_PROGRESS" "$CACHED"
+                    exit # is safe since this is a subshell
+                fi
+
+                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE_QUOTED' exited with status $EXIT_CODE."
+                break
             fi
             sleep 0.1
         done
 
         rm -f "$IN_PROGRESS"
 
-        if kill -INT "$PID" 2>/dev/null; then
+        # timeout reached, try to interrupt the command
+
+        if kill -0 "$PID" 2>/dev/null && kill -INT "$PID" 2>/dev/null; then
             sleep 2 # give it some time to finish
             if kill -0 "$PID" 2>/dev/null; then
-                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE' did not finish in time, killing it."
+                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE_QUOTED' did not finish in time, killing it."
                 kill -KILL "$PID" 2>/dev/null || true
             else
-                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE' finished after sending INT signal."
+                __BASHRC_DEBUG_OUTPUT "Command '$COMPLETE_LINE_QUOTED' finished after sending INT signal."
             fi
         fi
 
-        {
-            printf -v COMPLETE_LINE_QUOTED '%q ' "$@"
-            COMPLETE_LINE_QUOTED=${COMPLETE_LINE_QUOTED% }
+        # schedule for foreground execution
 
-            printf "echo 'Re-running: %s'\n" "$COMPLETE_LINE_QUOTED"
-            echo "${COMPLETE_LINE_QUOTED} | tee '$IN_PROGRESS' && mv '$IN_PROGRESS' '$CACHED'"
-            echo "rm -f '$IN_PROGRESS'"
-        } >>"$___BASHRC_FOREGROUND_FILE"
+        while ! mkdir "$___BASHRC_FOREGROUND_FILE_LOCK_DIR" 2>/dev/null; do
+            sleep 0.02
+        done
+
+        printf -v block '%s\n' \
+            "echo 'Re-running: $COMPLETE_LINE_QUOTED'" \
+            "${COMPLETE_LINE_QUOTED} | tee '$IN_PROGRESS' && mv '$IN_PROGRESS' '$CACHED'" \
+            "rm -f '$IN_PROGRESS'"
+        printf '%s' "$block" >>"$___BASHRC_FOREGROUND_FILE"
+
+        rmdir "$___BASHRC_FOREGROUND_FILE_LOCK_DIR" 2>/dev/null || true
     ) &
+
+    while ! mkdir "$___BASHRC_BACKGROUND_PIDS_FILE_LOCK_DIR" 2>/dev/null; do
+        sleep 0.02
+    done
+
+    printf '%s\n' "$!" >>"$___BASHRC_BACKGROUND_PIDS_FILE"
+
+    rmdir "$___BASHRC_BACKGROUND_PIDS_FILE_LOCK_DIR" 2>/dev/null || true
 }
 
 ___BASHRC_CLEAN_CACHE() (
@@ -162,7 +191,13 @@ done
 
 __BASHRC_DEBUG_OUTPUT "Done sourcing scripts!"
 
-wait # for background cache commands to finish
+if [[ -s "$___BASHRC_BACKGROUND_PIDS_FILE" ]]; then
+    mapfile -t ___BASHRC_PIDS <"$___BASHRC_BACKGROUND_PIDS_FILE"
+    wait "${___BASHRC_PIDS[@]}" 2>/dev/null || true
+fi
+
+rm -f "$___BASHRC_BACKGROUND_PIDS_FILE"
+rmdir "$___BASHRC_BACKGROUND_PIDS_FILE_LOCK_DIR" 2>/dev/null || true
 
 if [ -e "$___BASHRC_FOREGROUND_FILE" ]; then
     __BASHRC_DEBUG_OUTPUT "Running foreground commands from '$___BASHRC_FOREGROUND_FILE'"
@@ -174,6 +209,7 @@ else
 fi
 
 rm -f "$___BASHRC_FOREGROUND_FILE"
+rmdir "$___BASHRC_FOREGROUND_FILE_LOCK_DIR" 2>/dev/null || true
 
 if ((${#___BASHRC_CACHED_NOW[@]})); then
     __BASHRC_DEBUG_OUTPUT "Sourcing scripts cached now!"
@@ -201,6 +237,8 @@ if [ -z "$__BASHRC_DEBUG_KEEP" ]; then
     fns=$(compgen -A function | grep -E '^___?BASHRC_')
     # shellcheck disable=SC2086
     [ -n "$fns" ] && unset -f $fns
+    # cleanup the last used variables
+    unset vars fns
 else
     __BASHRC_DEBUG_OUTPUT "Keeping variables and functions set by the script as \$__BASHRC_DEBUG_KEEP was set"
 fi
