@@ -1,1 +1,0 @@
-__BASHRC_SOURCE_COMMAND_OUTPUT fzf --bash
