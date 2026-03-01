@@ -215,6 +215,7 @@ if ((${#___BASHRC_CACHED_NOW[@]})); then
     __BASHRC_DEBUG_OUTPUT "Sourcing scripts cached now!"
 
     ___BASHRC_CLEAN_CACHE &
+    disown "$!"
 
     for __BASHRC_CACHED in "${___BASHRC_CACHED_NOW[@]}"; do
         __BASHRC_DEBUG_OUTPUT "Sourcing cached script '$__BASHRC_CACHED'"
