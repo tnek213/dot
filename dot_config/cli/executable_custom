@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#
+# Custom install steps, run by `chezmoi-cli-tools` AFTER apt, BEFORE pipx/volta.
+# Plain bash — do your own host matching, e.g.:
+#
+#     if [[ $HOSTNAME =~ ^swift$ ]]; then cargo install just; fi
+#
+# CLI_TOOLS_UPGRADE is 1 when invoked with --upgrade, else 0.
+#
+# Gotcha: don't end the script on a bare `[[ … ]] && cmd` — a false test exits
+# non-zero and chezmoi-cli-tools treats the whole step as failed. Use an `if`
+# block, or end with `exit 0`.
+
+# Volta isn't packaged in apt — install it if missing (into VOLTA_HOME, which
+# 40_volta.bash always exports). --skip-setup keeps it out of shell profiles.
+command -v volta >/dev/null 2>&1 || curl -fsSL https://get.volta.sh | bash -s -- --skip-setup

@@ -1,0 +1,12 @@
+[[root]]
+path = "~/.claude/skills"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.claude/hooks"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.claude/bin"
+encryption = "all"
+levels = 0

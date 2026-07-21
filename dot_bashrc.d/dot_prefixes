@@ -1,0 +1,17 @@
+Prefix conventions for ~/.bashrc.d/ snippets.
+
+A snippet may only depend on snippets at lower-numbered levels.
+Snippets at the same level must not depend on each other.
+
+Levels 10-40 must use only bash builtins, coreutils, grep, sed, and
+findutils (find/xargs). Nothing else.
+
+20  Pure exports of variables and functions. No dependencies, no side effects.
+30  Pure exports.
+40  Side effects allowed (sources files, mkdir, shopt, etc). Bash builtins,
+    coreutils, grep, sed, findutils only.
+50  Third-party tool integration guarded by `command -v`. Base level for
+    command-v-guarded snippets.
+60  Same as 50, but for snippets that depend on another command-v-guarded
+    snippet (a 50-level snippet).
+80  Must run last (e.g. starship prompt init, kitty integration).

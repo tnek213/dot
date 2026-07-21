@@ -1,0 +1,11 @@
+[Unit]
+Description=Tend the Obsidian vault once per day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+Unit=obstend.service
+
+[Install]
+WantedBy=timers.target

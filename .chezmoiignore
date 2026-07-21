@@ -1,0 +1,31 @@
+README.md
+LICENSE
+CLAUDE.md
+
+# pipx-installed tool packages: live in the repo but are NOT deployed as
+# dotfiles; installed via .chezmoiscripts/run_onchange_*_pipx_chezmoi_tools.
+tools
+tools/**
+
+# Claude Code: never track secrets or machine-local runtime state
+.claude/.credentials.json
+.claude/history.jsonl
+.claude/stats-cache.json
+
+{{/* Ignore systemd user *-uses helper dirs whose matching unit isn't in source.
+     Keeps a service's tightly-coupled scripts/config tied to its unit's lifecycle. */ -}}
+{{- $sysd := joinPath .chezmoi.sourceDir "dot_config/systemd/user" -}}
+{{- range (glob (joinPath $sysd "*-uses")) -}}
+{{-   $dir := base . -}}
+{{-   $base := trimSuffix "-uses" $dir -}}
+{{-   $hasUnit := false -}}
+{{-   range list "service" "timer" "socket" "path" "target" "mount" "automount" "slice" -}}
+{{-     if glob (joinPath $sysd (printf "%s.%s" $base .)) -}}
+{{-       $hasUnit = true -}}
+{{-     end -}}
+{{-   end }}
+{{- if not $hasUnit }}
+.config/systemd/user/{{ $dir }}
+.config/systemd/user/{{ $dir }}/**
+{{- end -}}
+{{- end }}

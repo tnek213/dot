@@ -1,0 +1,9 @@
+[Unit]
+Description=Tend the Obsidian vault
+Documentation=file:/home/kent/Documents/notes/.scripts/obstend.py
+ConditionPathExists=%h/Documents/notes/.scripts/obstend.py
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/kent/Documents/notes/.scripts/obstend.py
+Nice=10

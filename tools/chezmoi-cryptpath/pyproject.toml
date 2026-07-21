@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chezmoi-cryptpath"
+version = "0.1.0"
+description = "chezmoi helper for the crypt/<id>.{age,yaml.age} encrypted-path scheme"
+requires-python = ">=3.8"
+
+# Ship the bash script as a package script (no Python code). pipx installs it
+# into ~/.local/bin and exposes it as the `chezmoi-cryptpath` command, which
+# chezmoi dispatches to as `chezmoi cryptpath ...`.
+[tool.setuptools]
+script-files = ["chezmoi-cryptpath"]
