@@ -10,3 +10,7 @@ levels = 0
 path = "~/.claude/bin"
 encryption = "all"
 levels = 0
+[[root]]
+path = "~/.claude/agents"
+encryption = "all"
+levels = 0
