@@ -1,6 +1,6 @@
 ---
 name: chezmoi
-description: Work with the local chezmoi dotfiles setup — its custom `crypt/` scheme (hides a file's name/path in git, not just content) and the `chezmoi-cryptpath` / `chezmoi-adopt` CLIs. Use for any chezmoi task - tracking/adopting a new dotfile, secret, or Claude skill/hook/bin script; encrypting, renaming, moving, or forgetting a managed file; changing a file's encryption state; or editing anything under `~/.local/share/chezmoi`.
+description: Work with the local chezmoi dotfiles setup — its custom `crypt/` scheme (hides a file's name/path in git, not just content) and the `chezmoi-cryptpath` / `chezmoi-adopt` CLIs. Use for any chezmoi task - tracking/adopting a new dotfile, secret, or Claude skill/hook/bin script; encrypting, renaming, moving, or forgetting a managed file; changing a file's encryption state; or editing anything under `~/.local/share/chezmoi`. Also load after creating, moving or deleting any file under `~/.claude/skills`, `~/.claude/hooks` or `~/.claude/bin` — those roots are chezmoi-adopted, so a new file there is untracked until `chezmoi adopt` runs and an edited one is unsynced until `chezmoi re-add` runs.
 ---
 
 # chezmoi setup
@@ -9,6 +9,12 @@ Source dir: `~/.local/share/chezmoi`. Encryption: age (identity
 `~/.config/chezmoi/key.txt`, recipient in `.chezmoi.toml.tmpl`).
 Standard chezmoi source naming applies (`dot_`, `private_`,
 `executable_`, `encrypted_*.age`, `*.tmpl`).
+
+The `chezmoi-ops` subagent does the mechanical work: adopting/tracking a
+new file, renaming or moving a crypt-managed file, converting a file's
+encryption state, forgetting an entry, listing what's managed. Delegate
+those there. Keep inline: diagnosing a broken `crypt/` state, anything
+touching `.hooks/`, template work, and any repair needing judgement.
 
 A managed file is in one of three states:
 
@@ -38,8 +44,7 @@ chezmoi cryptpath list-encrypted <parent-dir>   # listed → crypt
 chezmoi cryptpath list-clear <parent-dir>       # '🔒 ' → encrypted; listed plain → plain
 ```
 
-Listed by neither → unmanaged. After any change, re-run the matching
-list command (or `chezmoi status`) to confirm the result.
+Listed by neither → unmanaged.
 
 ## chezmoi-cryptpath — single files
 
@@ -105,6 +110,22 @@ chezmoi adopt list ['GLOB']
 chezmoi adopt ignore {add|remove|list} [PATTERN] [DIR...]  # no DIR = global; never touches .chezmoiignore
 chezmoi adopt remove PATH...   # file → chezmoi forget; exact root path → drop rule + forget its files
 ```
+
+## Always verify after a mutation
+
+Every one of these commands can leave the metadata and the working tree
+disagreeing without saying so. After *any* add/adopt/move/convert/forget,
+before reporting success:
+
+```sh
+chezmoi status                                  # expect: clean, or only intended entries
+chezmoi cryptpath list-encrypted <parent-dir>   # crypt-state files
+chezmoi cryptpath list-clear <parent-dir>       # plain + '🔒 ' encrypted
+```
+
+Report the state you actually observed, not the state the command
+claimed. A file listed by neither is unmanaged — that is a failure, not
+a no-op.
 
 ## If a command fails
 
