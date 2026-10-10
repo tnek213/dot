@@ -1,6 +1,6 @@
 ---
 name: chezmoi
-description: Work with the local chezmoi dotfiles setup — its custom `crypt/` scheme (hides a file's name/path in git, not just content) and the `chezmoi-cryptpath` / `chezmoi-adopt` CLIs. Use for any chezmoi task - tracking/adopting a new dotfile, secret, or Claude skill/hook/bin script; encrypting, renaming, moving, or forgetting a managed file; changing a file's encryption state; or editing anything under `~/.local/share/chezmoi`. Also load after creating, moving or deleting any file under `~/.claude/skills`, `~/.claude/hooks` or `~/.claude/bin` — those roots are chezmoi-adopted, so a new file there is untracked until `chezmoi adopt` runs and an edited one is unsynced until `chezmoi re-add` runs.
+description: Work with the local chezmoi dotfiles setup — its custom `crypt/` scheme (hides a file's name/path in git, not just content) and the `chezmoi-cryptpath` / `chezmoi-adopt` CLIs. Use for any chezmoi task - tracking/adopting a new dotfile, secret, or Claude skill/hook/bin script; encrypting, renaming, moving, or forgetting a managed file; changing a file's encryption state; or editing anything under `~/.local/share/chezmoi`. Also load after creating, moving or deleting any file under `~/.claude/skills`, `~/.claude/hooks` or `~/.claude/bin` — those roots are chezmoi-adopted, so a new file there is untracked until `chezmoi adopt` runs and an edited one is unsynced until `chezmoi re-add` runs. Also load for any request to change, add, or look up a VS Code setting ("set X in VS Code", "change the Copilot/editor/font setting", "what's my VS Code setting for Y") — these are chezmoi-templated from per-extension fragment files, not edited in settings.json directly.
 ---
 
 # chezmoi setup
@@ -110,6 +110,49 @@ chezmoi adopt list ['GLOB']
 chezmoi adopt ignore {add|remove|list} [PATTERN] [DIR...]  # no DIR = global; never touches .chezmoiignore
 chezmoi adopt remove PATH...   # file → chezmoi forget; exact root path → drop rule + forget its files
 ```
+
+## VS Code settings (centralized, per-extension)
+
+`~/.config/Code/User/settings.json` is chezmoi-generated, not hand-edited.
+Source of truth is one JSON file per extension (flat `"key": value` pairs,
+same keys VS Code itself uses) under:
+
+```
+~/.local/share/chezmoi/.chezmoitemplates/vscode-settings/*.json
+```
+
+e.g. `copilot.json` (core completions), `copilot-chat.json` (chat/agent
+settings), `editor.json` (font etc. — core editor settings get a fragment
+too, not just extensions). `dot_config/Code/User/settings.json.tmpl` globs
+every file in that directory and merges them; it fails loudly at apply/diff
+time if two fragments define the same key (never silently overwritten).
+
+**To change a setting:** edit the owning fragment (or add a key/new fragment
+file for an extension not yet tracked) — never edit a live `settings.json`
+for anything that should stay centralized. `chezmoi diff` to preview,
+`chezmoi apply` to write. Don't commit without being asked.
+
+**Full regen, not merge:** the target file is completely overwritten each
+apply from current fragment content, so deleting a key from a fragment
+deletes it from `settings.json` too — no stray leftover keys.
+
+**Profiles:** `.chezmoiscripts/run_onchange_after_65_vscode_profile_settings.sh.tmpl`
+propagates the same merged settings into every `~/.config/Code/User/profiles/*/settings.json`
+after the main file is written (re-runs automatically when a fragment's
+content changes, via embedded hashes in the script). It purges from each
+profile every key that was *ever* managed (tracked in
+`~/.config/Code/.chezmoi-vscode-managed-keys.json`) before reapplying
+current values — so a key removed from a fragment disappears from every
+profile too. It pushes every fragment to every profile unconditionally,
+even extensions that profile doesn't have installed (profiles each have
+their own independent extension set in VS Code) — inert until installed
+there, deliberately simpler than tracking per-profile extension state.
+
+A manual edit to an already-fragment-tracked key, made directly in VS
+Code's Settings UI or any `settings.json`, gets silently reverted on the
+next `chezmoi apply` (the fragment is the source of truth) — update the
+fragment instead, or report the edit (key + value + which file) so the
+fragment gets updated to match before the next apply.
 
 ## Always verify after a mutation
 

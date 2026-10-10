@@ -1,0 +1,49 @@
+#!/bin/bash
+set -euo pipefail
+
+# Propagates the chezmoi-managed VS Code extension settings (see
+# .chezmoitemplates/vscode-settings/*.json and dot_config/Code/User/settings.json.tmpl)
+# into every VS Code profile's own settings.json, so a change to one
+# fragment file applies everywhere, not just the default profile.
+#
+# Deliberately unconditional: every fragment is pushed to every profile,
+# even if that profile doesn't have the extension installed (profiles each
+# have their own independent extension set in VS Code). An inapplicable
+# setting just sits inert until the extension is installed there - at which
+# point the preferred config is already waiting. Simpler and more robust
+# than tracking each profile's installed-extensions state.
+#
+# Re-runs whenever any fragment's content changes:
+{{ range $path := (sortAlpha (glob (joinPath .chezmoi.sourceDir ".chezmoitemplates/vscode-settings/*.json"))) -}}
+#   {{ $path }}: {{ include $path | sha256sum }}
+{{ end -}}
+
+SHARED="$HOME/.config/Code/User/settings.json"
+PROFILES_DIR="$HOME/.config/Code/User/profiles"
+MANIFEST="$HOME/.config/Code/.chezmoi-vscode-managed-keys.json"
+
+[ -f "$SHARED" ] || exit 0
+[ -d "$PROFILES_DIR" ] || exit 0
+command -v jq >/dev/null 2>&1 || { echo "vscode profile sync: jq not found, skipping" >&2; exit 0; }
+
+shared_keys=$(jq -c 'keys' "$SHARED")
+old_keys="[]"
+[ -f "$MANIFEST" ] && old_keys=$(jq -c '.' "$MANIFEST")
+
+# Union of this run's and the previous run's managed keys: anything that
+# used to be managed but was removed from a fragment must be purged too,
+# not just left stale in each profile's settings.json.
+purge_keys=$(jq -cn --argjson a "$old_keys" --argjson b "$shared_keys" '($a + $b) | unique')
+
+for profile_settings in "$PROFILES_DIR"/*/settings.json; do
+    [ -f "$profile_settings" ] || continue
+    tmp=$(mktemp)
+    jq --argjson purge "$purge_keys" --slurpfile shared "$SHARED" '
+        . as $profile
+        | (reduce $purge[] as $k ($profile; del(.[$k])))
+        | . * $shared[0]
+    ' "$profile_settings" > "$tmp" && mv "$tmp" "$profile_settings"
+    echo "vscode profile sync: updated $profile_settings"
+done
+
+echo "$shared_keys" > "$MANIFEST"
