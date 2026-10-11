@@ -4,7 +4,10 @@ set -euo pipefail
 # Propagates the chezmoi-managed VS Code extension settings (see
 # .chezmoitemplates/vscode-settings/*.json and dot_config/Code/User/settings.json.tmpl)
 # into every VS Code profile's own settings.json, so a change to one
-# fragment file applies everywhere, not just the default profile.
+# fragment file applies everywhere, not just the default profile. Creates
+# a profile's settings.json if it doesn't have one yet, so a brand new
+# profile gets the centralized settings immediately rather than waiting
+# for its first manual edit.
 #
 # Deliberately unconditional: every fragment is pushed to every profile,
 # even if that profile doesn't have the extension installed (profiles each
@@ -20,10 +23,11 @@ set -euo pipefail
 
 SHARED="$HOME/.config/Code/User/settings.json"
 PROFILES_DIR="$HOME/.config/Code/User/profiles"
+STORAGE_JSON="$HOME/.config/Code/User/globalStorage/storage.json"
 MANIFEST="$HOME/.config/Code/.chezmoi-vscode-managed-keys.json"
 
 [ -f "$SHARED" ] || exit 0
-[ -d "$PROFILES_DIR" ] || exit 0
+[ -f "$STORAGE_JSON" ] || exit 0
 command -v jq >/dev/null 2>&1 || { echo "vscode profile sync: jq not found, skipping" >&2; exit 0; }
 
 shared_keys=$(jq -c 'keys' "$SHARED")
@@ -35,8 +39,18 @@ old_keys="[]"
 # not just left stale in each profile's settings.json.
 purge_keys=$(jq -cn --argjson a "$old_keys" --argjson b "$shared_keys" '($a + $b) | unique')
 
-for profile_settings in "$PROFILES_DIR"/*/settings.json; do
-    [ -f "$profile_settings" ] || continue
+# Profile directories are looked up from VS Code's own registry rather than
+# a fixed-depth glob: non-default profiles can live at varying depths (e.g.
+# a built-in profile template lives at profiles/builtin/<id>, two levels
+# deep, not profiles/<id> like a normal user-created profile). The Default
+# profile is intentionally excluded here - it's not listed in
+# userDataProfiles and is already handled directly by settings.json.tmpl.
+jq -r '.userDataProfiles[]?.location // empty' "$STORAGE_JSON" | while IFS= read -r location; do
+    [ -n "$location" ] || continue
+    profile_dir="$PROFILES_DIR/$location"
+    profile_settings="$profile_dir/settings.json"
+    mkdir -p "$profile_dir"
+    [ -f "$profile_settings" ] || echo '{}' > "$profile_settings"
     tmp=$(mktemp)
     jq --argjson purge "$purge_keys" --slurpfile shared "$SHARED" '
         . as $profile
