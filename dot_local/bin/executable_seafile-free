@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Block until a set of 5 checks, 3 seconds apart, all find Seafile idle.
+# A busy check ends the set; the next set starts after 20 seconds.
+# Exits 0 when idle, >0 if the seafile command cannot be executed.
+
+set -u
+
+checks=5
+check_delay=3
+set_delay=20
+
+seafile_status() {
+    flatpak run --command=seaf-cli com.seafile.Client status --json
+}
+
+is_busy() {
+    local out
+    out=$(seafile_status) || return 2
+    jq -e 'any(.[]; .state | test("^(syncing|uploading|downloading)$"))' \
+        <<<"$out" >/dev/null 2>&1
+    case $? in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Returns 0 if every check in the set was idle, 1 if any was busy.
+run_set() {
+    local i rc
+    for ((i = 0; i < checks; i++)); do
+        ((i > 0)) && sleep "$check_delay"
+        is_busy
+        rc=$?
+        case $rc in
+            0) return 1 ;;
+            1) ;;
+            *)
+                echo "seafile-free: cannot get seafile status" >&2
+                exit 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+until run_set; do
+    sleep "$set_delay"
+done
+exit 0
