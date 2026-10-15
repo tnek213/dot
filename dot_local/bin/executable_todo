@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""todo — Vikunja task manager CLI."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DEFAULT_URL = "https://todo.fasa.se"
+CONFIG_PATH = Path.home() / ".config" / "vikunja" / "config.json"
+PER_PAGE = 50
+# (name, suffix, seconds) — used for both parsing and formatting repeat intervals
+REPEAT_UNITS = (
+    ("yearly", "y", 31536000),
+    ("monthly", "m", 2592000),
+    ("weekly", "w", 604800),
+    ("daily", "d", 86400),
+)
+
+CFG: dict = {}
+
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    return json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+
+
+def save_config() -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(CFG, indent=2))
+    CONFIG_PATH.chmod(0o600)
+
+
+# ── api ───────────────────────────────────────────────────────────────────────
+
+def request(method: str, url: str, body=None, headers: dict | None = None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json", **(headers or {})},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            raw = json.loads(raw).get("message", raw)
+        except ValueError:
+            pass
+        sys.exit(f"API error {e.code}: {raw}")
+
+
+def api(method: str, path: str, body=None, **params):
+    if not CFG.get("token"):
+        sys.exit("Not logged in. Run: todo login")
+    url = CFG.get("url", DEFAULT_URL).rstrip("/") + "/api/v1" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return request(method, url, body, {"Authorization": f"Bearer {CFG['token']}"})
+
+
+def api_all(path: str, **params) -> list:
+    """GET every page of a paginated collection (the API caps per_page)."""
+    out: list = []
+    for page in range(1, 1000):
+        chunk = api("GET", path, page=page, per_page=PER_PAGE, **params) or []
+        out += chunk
+        if len(chunk) < PER_PAGE:
+            return out
+    return out
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def parse_repeat(s: str) -> int:
+    s = s.strip().lower()
+    for name, suffix, secs in REPEAT_UNITS:
+        if s == name:
+            return secs
+        if s[-1:] == suffix and s[:-1].isdigit():
+            return int(s[:-1]) * secs
+    sys.exit(f"Unknown repeat format '{s}'. Use: daily, weekly, monthly, yearly, Nd, Nw, Nm, Ny")
+
+
+def fmt_repeat(secs: int) -> str:
+    for name, suffix, unit in REPEAT_UNITS:
+        n, rest = divmod(secs, unit)
+        if rest == 0:
+            return name if n == 1 else f"every {n}{suffix}"
+    return f"{secs}s"
+
+
+def parse_due(s: str) -> str:
+    s = s.strip().lower()
+    if s == "tomorrow":
+        d = datetime.now(timezone.utc) + timedelta(days=1)
+    elif s.startswith("+") and s[1:].rstrip("d").isdigit():
+        d = datetime.now(timezone.utc) + timedelta(days=int(s[1:].rstrip("d")))
+    else:
+        try:
+            d = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            sys.exit(f"Unknown due format '{s}'. Use: YYYY-MM-DD, tomorrow, +Nd")
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve_project(name: str | None) -> int:
+    projects = api("GET", "/projects")
+    if not projects:
+        sys.exit("No projects found.")
+    if name is None:
+        name = CFG.get("default_project")
+        if name is None:
+            if len(projects) == 1:
+                return projects[0]["id"]
+            names = ", ".join(f"{p['title']} (id={p['id']})" for p in projects)
+            sys.exit(f"Multiple projects — specify --project. Available: {names}")
+    for p in projects:
+        if str(p["id"]) == str(name) or p["title"].lower() == str(name).lower():
+            return p["id"]
+    sys.exit(f"Project '{name}' not found.")
+
+
+def project_ids(name: str | None) -> list[int]:
+    """One project, or every real project when name is 'all'.
+
+    Saved filters are returned by /projects too, with negative ids; their tasks
+    live in the real projects, so including them would visit tasks twice.
+    """
+    if name == "all":
+        return [p["id"] for p in api("GET", "/projects") or [] if p["id"] > 0]
+    return [resolve_project(name)]
+
+
+def kanban_buckets(project_id: int) -> tuple[dict[int, str], dict[int, int]]:
+    """Return ({bucket_id: title}, {task_id: bucket_id}) for the kanban view."""
+    views = api("GET", f"/projects/{project_id}/views") or []
+    view = next((v for v in views if v.get("view_kind") == "kanban"), None)
+    if not view:
+        return {}, {}
+    data = api("GET", f"/projects/{project_id}/views/{view['id']}/tasks", per_page=PER_PAGE) or []
+    titles = {b["id"]: b.get("title", str(b["id"])) for b in data}
+    where = {t["id"]: b["id"] for b in data for t in (b.get("tasks") or [])}
+    return titles, where
+
+
+def kanban_view_id(project_id: int) -> int:
+    views = api("GET", f"/projects/{project_id}/views") or []
+    view = next((v for v in views if v.get("view_kind") == "kanban"), None)
+    if not view:
+        sys.exit("No kanban view found for this project.")
+    return view["id"]
+
+
+def resolve_bucket(buckets: dict[int, str], name: str) -> int:
+    """Find bucket id by case-insensitive name prefix."""
+    for bid, title in buckets.items():
+        if title.lower().startswith(name.lower()):
+            return bid
+    sys.exit(f"Bucket '{name}' not found. Available: {', '.join(buckets.values())}")
+
+
+def fmt_task(t: dict, indent: int = 0, buckets: dict | None = None) -> str:
+    parts = [f"{'  ' * indent}{'✓' if t.get('done') else '○'} [{t['id']}] {t['title']}"]
+    if t.get("due_date") and not t["due_date"].startswith("0001"):
+        parts.append("  due:" + t["due_date"][:10])
+    if t.get("start_date") and not t["start_date"].startswith("0001"):
+        parts.append("  start:" + t["start_date"][:10])
+    if t.get("repeat_after", 0) > 0:
+        parts.append("  repeat:" + fmt_repeat(t["repeat_after"]))
+    if buckets and not t.get("done"):
+        name = buckets.get(t.get("bucket_id", 0), "")
+        if name and name.lower() not in ("to-do", "todo"):
+            parts.append(f"  [{name}]")
+    return "".join(parts)
+
+
+def read_arg(s: str) -> str:
+    """Return the argument, or stdin if it is '-'."""
+    return sys.stdin.read() if s == "-" else s
+
+
+def to_html(text: str) -> str:
+    """Vikunja stores descriptions as HTML; keep plain-text line breaks intact."""
+    text = text.strip()
+    if not text or ("<" in text and ">" in text):
+        return text
+    blocks = []
+    for block in text.split("\n\n"):
+        lines = [html.escape(line) for line in block.strip().split("\n") if line.strip()]
+        if lines:
+            blocks.append("<p>" + "<br>".join(lines) + "</p>")
+    return "".join(blocks)
+
+
+def from_html(s: str) -> str:
+    """Rough inverse of to_html for terminal display."""
+    s = re.sub(r"<br\s*/?>", "\n", s)
+    s = re.sub(r"</p>\s*<p>", "\n\n", s)
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+def fmt_comment(c: dict) -> str:
+    author = c.get("author", {}).get("username", "?")
+    text = from_html(c["comment"]).replace("\n", "\n      ")
+    return f"  [{c['id']}] {c.get('created', '')[:10]} {author}: {text}"
+
+
+def apply_fields(t: dict, args) -> dict:
+    """Copy the shared --title/--description/--due/--repeat options onto a task."""
+    if getattr(args, "title", None):
+        t["title"] = args.title
+    if args.description is not None:
+        t["description"] = to_html(read_arg(args.description))
+    if args.due:
+        t["due_date"] = parse_due(args.due)
+    if args.start:
+        t["start_date"] = parse_due(args.start)
+    if args.repeat:
+        t["repeat_after"] = parse_repeat(args.repeat)
+        t["repeat_mode"] = 0
+    return t
+
+
+def confirm(args, count: int, what: str) -> bool:
+    """Gate a bulk change behind --yes; otherwise report it as a dry run."""
+    if not count:
+        print(f"Nothing to {what}.")
+        return False
+    if not args.yes:
+        print(f"\n{count} task(s) to {what} — re-run with --yes to apply.")
+        return False
+    return True
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_login(args):
+    import getpass
+    url = (args.url or CFG.get("url", DEFAULT_URL)).rstrip("/")
+    body = {"username": input("Username: "), "password": getpass.getpass("Password: ")}
+    result = request("POST", url + "/api/v1/user/login", body)
+    CFG.update(token=result["token"], url=url)
+    save_config()
+    print(f"Logged in. Token saved to {CONFIG_PATH}")
+
+
+def cmd_token(args):
+    CFG["token"] = args.token
+    if args.url:
+        CFG["url"] = args.url.rstrip("/")
+    save_config()
+    print(f"Token saved to {CONFIG_PATH}")
+
+
+def cmd_projects(args):
+    projects = api("GET", "/projects")
+    if not projects:
+        print("No projects.")
+        return
+    for p in projects:
+        marker = " *" if p["id"] == CFG.get("default_project") else ""
+        print(f"  [{p['id']}] {p['title']}{marker}")
+
+
+def cmd_default(args):
+    CFG["default_project"] = resolve_project(args.project)
+    save_config()
+    print(f"Default project set to {CFG['default_project']}")
+
+
+def cmd_list(args):
+    pid = resolve_project(args.project)
+    buckets, where = kanban_buckets(pid)
+    tasks = api_all(f"/projects/{pid}/tasks", filter="done = false")
+    if not tasks:
+        print("No open tasks.")
+        return
+    by_id = {t["id"]: t for t in tasks}
+    for t in tasks:
+        t["bucket_id"] = where.get(t["id"], 0)
+    children = {t["id"]: (t.get("related_tasks") or {}).get("subtask", []) for t in tasks}
+    subtask_ids = {s["id"] for subs in children.values() for s in subs}
+    for t in sorted(tasks, key=lambda x: x["id"]):
+        if t["id"] in subtask_ids:
+            continue
+        print(fmt_task(t, buckets=buckets))
+        for sub in sorted(children[t["id"]], key=lambda x: x["id"]):
+            print(fmt_task(by_id.get(sub["id"], sub), indent=1, buckets=buckets))
+
+
+def cmd_show(args):
+    t = api("GET", f"/tasks/{args.id}")
+    buckets = kanban_buckets(t["project_id"])[0] if t.get("project_id") else {}
+    print(fmt_task(t, buckets=buckets))
+    for line in from_html(t.get("description") or "").splitlines():
+        print(f"  {line}" if line else "")
+    for rel in (t.get("related_tasks") or {}).get("subtask", []):
+        print(fmt_task(rel, indent=1, buckets=buckets))
+    comments = api("GET", f"/tasks/{args.id}/comments") or []
+    if comments:
+        print("  comments:")
+        for c in comments:
+            print(fmt_comment(c))
+
+
+def cmd_add(args):
+    pid = resolve_project(args.project)
+    t = api("PUT", f"/projects/{pid}/tasks", apply_fields({"title": args.title, "project_id": pid}, args))
+    if args.parent:
+        api("PUT", f"/tasks/{args.parent}/relations",
+            {"other_task_id": t["id"], "relation_kind": "subtask"})
+    print(f"Created: {fmt_task(t)}")
+
+
+def cmd_done(args):
+    t = api("GET", f"/tasks/{args.id}")
+    api("POST", f"/tasks/{args.id}", {**t, "done": True})
+    print(f"Done: [{args.id}] {t['title']}")
+
+
+def cmd_rm(args):
+    t = api("GET", f"/tasks/{args.id}")
+    api("DELETE", f"/tasks/{args.id}")
+    print(f"Deleted: [{args.id}] {t['title']}")
+
+
+def cmd_edit(args):
+    t = apply_fields(api("GET", f"/tasks/{args.id}"), args)
+    if args.project:
+        t["project_id"] = resolve_project(args.project)
+    api("POST", f"/tasks/{args.id}", t)
+    print(f"Updated: {fmt_task(t)}")
+
+
+def cmd_bucket(args):
+    t = api("GET", f"/tasks/{args.id}")
+    pid = t["project_id"]
+    buckets = kanban_buckets(pid)[0]
+    bid = resolve_bucket(buckets, args.bucket)
+    api("POST", f"/projects/{pid}/views/{kanban_view_id(pid)}/buckets/{bid}/tasks",
+        {"task_id": args.id})
+    print(f"Moved [{args.id}] to {buckets[bid]}: {t['title']}")
+
+
+def cmd_purge(args):
+    """Delete completed tasks, optionally only those done for a while."""
+    expr = "done = true"
+    if args.older_than:
+        expr += f" && done_at < now-{args.older_than}"
+    doomed = [t for pid in project_ids(args.project)
+              for t in api_all(f"/projects/{pid}/tasks", filter=expr)]
+    for t in doomed:
+        print(f"  {fmt_task(t)}")
+    if confirm(args, len(doomed), "delete"):
+        for t in doomed:
+            api("DELETE", f"/tasks/{t['id']}")
+        print(f"Deleted {len(doomed)} task(s).")
+
+
+def find_or_create_label(title: str) -> int:
+    for label in api_all("/labels"):
+        if label["title"].lower() == title.lower():
+            return label["id"]
+    return api("PUT", "/labels", {"title": title})["id"]
+
+
+def cmd_label_subtasks(args):
+    """Keep a label in sync with which tasks are a subtask of another task."""
+    tasks = [t for pid in project_ids(args.project)
+             for t in api_all(f"/projects/{pid}/tasks")]
+    subtask_ids = {sub["id"] for t in tasks
+                   for sub in (t.get("related_tasks") or {}).get("subtask", [])}
+    label_id = find_or_create_label(args.label)
+    add, remove = [], []
+    for t in tasks:
+        labelled = any(l["id"] == label_id for l in (t.get("labels") or []))
+        if t["id"] in subtask_ids and not labelled:
+            add.append(t)
+        elif labelled and t["id"] not in subtask_ids and args.prune:
+            remove.append(t)
+    for t in add:
+        print(f"  + {fmt_task(t)}")
+    for t in remove:
+        print(f"  - {fmt_task(t)}")
+    if confirm(args, len(add) + len(remove), f"label '{args.label}'"):
+        for t in add:
+            api("PUT", f"/tasks/{t['id']}/labels", {"label_id": label_id})
+        for t in remove:
+            api("DELETE", f"/tasks/{t['id']}/labels/{label_id}")
+        print(f"Labelled {len(add)}, unlabelled {len(remove)}.")
+
+
+def cmd_comments(args):
+    comments = api("GET", f"/tasks/{args.id}/comments") or []
+    for c in comments:
+        print(fmt_comment(c))
+    if not comments:
+        print("No comments.")
+
+
+def cmd_comment_add(args):
+    c = api("PUT", f"/tasks/{args.id}/comments", {"comment": args.text})
+    print(f"Added comment [{c['id']}]")
+
+
+def cmd_comment_edit(args):
+    api("POST", f"/tasks/{args.task_id}/comments/{args.comment_id}", {"comment": args.text})
+    print(f"Updated comment [{args.comment_id}]")
+
+
+def cmd_comment_rm(args):
+    api("DELETE", f"/tasks/{args.task_id}/comments/{args.comment_id}")
+    print(f"Deleted comment [{args.comment_id}]")
+
+
+# ── parser ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(prog="todo", description="Vikunja task manager CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def command(name, func, help):
+        p = sub.add_parser(name, help=help)
+        p.set_defaults(func=func)
+        return p
+
+    command("login", cmd_login, "authenticate and store token").add_argument(
+        "--url", default="", help=f"instance URL (default: {DEFAULT_URL})")
+
+    p = command("token", cmd_token, "store an API token directly")
+    p.add_argument("token", help="API token from Settings → API Tokens")
+    p.add_argument("--url", default="", help=f"instance URL (default: {DEFAULT_URL})")
+
+    command("projects", cmd_projects, "list projects")
+
+    command("default", cmd_default, "set default project").add_argument(
+        "project", help="project name or id")
+
+    command("list", cmd_list, "list open tasks").add_argument(
+        "--project", "-p", default=None, help="project name or id")
+
+    command("show", cmd_show, "show task, subtasks, and comments").add_argument(
+        "id", type=int)
+
+    p = command("add", cmd_add, "create a task")
+    p.add_argument("title", help="task title")
+    p.add_argument("--project", "-p", default=None)
+    p.add_argument("--description", "-D", default=None, help="task description ('-' reads stdin)")
+    p.add_argument("--due", "-d", default=None, help="due date: YYYY-MM-DD, tomorrow, +Nd")
+    p.add_argument("--start", "-s", default=None, help="start date: YYYY-MM-DD, tomorrow, +Nd")
+    p.add_argument("--repeat", "-r", default=None, help="repeat: daily, weekly, monthly, yearly, Nd")
+    p.add_argument("--parent", type=int, default=None, help="parent task id (creates subtask)")
+
+    command("done", cmd_done, "mark task complete").add_argument("id", type=int)
+    command("rm", cmd_rm, "delete task").add_argument("id", type=int)
+
+    p = command("edit", cmd_edit, "edit a task")
+    p.add_argument("id", type=int)
+    p.add_argument("--title", default=None)
+    p.add_argument("--description", "-D", default=None,
+                   help="task description ('-' reads stdin, '' clears)")
+    p.add_argument("--due", default=None)
+    p.add_argument("--start", default=None)
+    p.add_argument("--repeat", default=None)
+    p.add_argument("--project", "-p", default=None, help="move task to this project (name or id)")
+
+    p = command("bucket", cmd_bucket, "move task to a kanban bucket (e.g. todo, doing, done)")
+    p.add_argument("id", type=int)
+    p.add_argument("bucket", help="bucket name prefix (case-insensitive)")
+
+    p = command("purge", cmd_purge, "delete completed tasks (dry run without --yes)")
+    p.add_argument("--project", "-p", default="all", help="project name or id (default: all)")
+    p.add_argument("--older-than", default=None, metavar="AGE",
+                   help="only tasks done longer ago than this, e.g. 30d, 6w, 1y")
+    p.add_argument("--yes", action="store_true", help="actually delete")
+
+    p = command("label-subtasks", cmd_label_subtasks,
+                "label every subtask (dry run without --yes)")
+    p.add_argument("--project", "-p", default="all", help="project name or id (default: all)")
+    p.add_argument("--label", default="subtask", help="label to apply (created if missing)")
+    p.add_argument("--prune", action="store_true",
+                   help="also remove the label from tasks that are no longer subtasks")
+    p.add_argument("--yes", action="store_true", help="actually apply the changes")
+
+    command("comments", cmd_comments, "list comments on a task").add_argument("id", type=int)
+
+    p = command("comment-add", cmd_comment_add, "add a comment to a task")
+    p.add_argument("id", type=int, help="task id")
+    p.add_argument("text", help="comment text")
+
+    p = command("comment-edit", cmd_comment_edit, "edit a comment")
+    p.add_argument("task_id", type=int)
+    p.add_argument("comment_id", type=int)
+    p.add_argument("text", help="new comment text")
+
+    p = command("comment-rm", cmd_comment_rm, "delete a comment")
+    p.add_argument("task_id", type=int)
+    p.add_argument("comment_id", type=int)
+
+    args = parser.parse_args()
+    CFG.update(load_config())
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
