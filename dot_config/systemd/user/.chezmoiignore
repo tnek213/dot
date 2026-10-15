@@ -3,8 +3,8 @@
 dropbox.service
 {{- end -}}
 {{- if not (and $st $st.isDir (lookPath "rsync")) -}}
-tor-mirror.service
-tor-mirror.timer
+dropbox-mirror.service
+dropbox-mirror.timer
 {{- end -}}
 {{- if not (lookPath "obsidian") -}}
 obstend.service

@@ -1,5 +1,5 @@
 [Unit]
-Description=Mirror Dropbox/Tor to Seafile every 15 minutes
+Description=Mirror Dropbox folders to Seafile every 15 minutes
 
 [Timer]
 OnBootSec=5min

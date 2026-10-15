@@ -1,7 +1,0 @@
-[Unit]
-Description=Hard-link mirror Dropbox/Tor to Seafile FamilySharedPhotos
-
-[Service]
-Type=oneshot
-ExecCondition=/bin/sh -c '[ "$(%h/.local/bin/dropbox status)" = "Up to date" ]'
-ExecStart=/usr/bin/rsync -a --delete --link-dest=%h/Dropbox/Tor/ %h/Dropbox/Tor/ %h/Seafile/FamilySharedPhotos/
