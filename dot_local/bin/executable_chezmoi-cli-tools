@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# chezmoi-cli-tools [-n|--dry-run] [--upgrade] [CONFIG_DIR]
+#
+# Install the CLI tools declared for this host in ~/.config/cli/, in the order
+# apt -> custom -> pipx -> volta. apt/pipx/volta are [host-glob] package lists
+# ([*] matches every host); custom is a plain bash script, run as-is (it does
+# its own host matching). Default: install only what's missing; --upgrade
+# upgrades. A manager is skipped if its tool or config is absent.
+#
+# apt self-elevates with sudo for its install step; custom/pipx/volta are
+# user-scoped. Run it as yourself (e.g. `chezmoi cli-tools`); NOT run by apply.
+
+set -euo pipefail
+
+usage() { sed -n '3,12p' "$0" | sed 's/^#\s\?//'; }
+
+dry=0
+upgrade=0
+config_dir=""
+while (( $# )); do
+	case "$1" in
+		-n|--dry-run) dry=1; shift ;;
+		--upgrade)    upgrade=1; shift ;;
+		-h|--help)    usage; exit 0 ;;
+		--) shift; [[ $# -gt 0 ]] && config_dir="$1"; break ;;
+		-*) echo "chezmoi-cli-tools: unknown option: $1" >&2; exit 2 ;;
+		*) config_dir="$1"; shift ;;
+	esac
+done
+
+if [[ -z "$config_dir" ]]; then
+	if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" ]]; then
+		h="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+		config_dir="${h:-$HOME}/.config/cli"
+	else
+		config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/cli"
+	fi
+fi
+
+host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || uname -n)"
+host="${host%%.*}"
+
+# Emit the config lines active for $host (one per line) from file $1.
+parse_active() {
+	local file="$1" active=0 line glob
+	[[ -f "$file" ]] || return 0
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		[[ "$line" =~ ^[[:space:]]*# ]] && continue
+		[[ "$line" == *" #"* ]] && line="${line%% #*}"
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		[[ -z "$line" ]] && continue
+		if [[ "$line" == \[*\] ]]; then
+			glob="${line#\[}"; glob="${glob%\]}"
+			# shellcheck disable=SC2053
+			if [[ "$host" == $glob ]]; then active=1; else active=0; fi
+			continue
+		fi
+		(( active )) && printf '%s\n' "$line"
+	done < "$file"
+}
+
+# --- apt: system packages, self-elevates with sudo -------------------------
+run_apt() {
+	command -v apt-get >/dev/null 2>&1 || { echo "apt:    skipped (apt-get not found)"; return 0; }
+	local pkgs; mapfile -t pkgs < <(parse_active "$config_dir/apt")
+	(( ${#pkgs[@]} )) || { echo "apt:    nothing for host '$host'"; return 0; }
+	local opts=(install -y); (( upgrade )) || opts+=(--no-upgrade)
+	if (( dry )); then printf 'apt would %s: %s\n' "$( ((upgrade)) && echo install || echo 'install (missing only)')" "${pkgs[*]}"; return 0; fi
+	echo "apt:    apt-get ${opts[*]} — ${#pkgs[@]} package(s)"
+	if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+		env DEBIAN_FRONTEND=noninteractive apt-get "${opts[@]}" "${pkgs[@]}"
+	else
+		command -v sudo >/dev/null 2>&1 || { echo "apt: need root or sudo to install" >&2; return 1; }
+		sudo env DEBIAN_FRONTEND=noninteractive apt-get "${opts[@]}" "${pkgs[@]}"
+	fi
+}
+
+# --- custom: a user bash script that does its own host matching ------------
+run_custom() {
+	local script="$config_dir/custom"
+	[[ -f "$script" ]] || { echo "custom: no script at $script"; return 0; }
+	if (( dry )); then echo "custom: would run $script"; return 0; fi
+	echo "custom: running $script"
+	CLI_TOOLS_UPGRADE="$upgrade" bash "$script"
+}
+
+# --- pipx: user-scoped python apps -----------------------------------------
+run_pipx() {
+	command -v pipx >/dev/null 2>&1 || { echo "pipx:   skipped (pipx not found)"; return 0; }
+	local specs; mapfile -t specs < <(parse_active "$config_dir/pipx")
+	(( ${#specs[@]} )) || { echo "pipx:   nothing for host '$host'"; return 0; }
+	local s rc=0
+	for s in "${specs[@]}"; do
+		if (( dry )); then printf 'pipx would install%s: %s\n' "$( ((upgrade)) && echo ' --force')" "$s"; continue; fi
+		if (( upgrade )); then
+			echo "pipx:   install --force $s"; pipx install --force "$s" || rc=1
+		else
+			# `pipx install` is a no-op if already present.
+			echo "pipx:   install $s"; pipx install "$s" || rc=1
+		fi
+	done
+	return $rc
+}
+
+# --- volta: user-scoped node toolchain -------------------------------------
+run_volta() {
+	command -v volta >/dev/null 2>&1 || { echo "volta:  skipped (volta not found)"; return 0; }
+	local specs; mapfile -t specs < <(parse_active "$config_dir/volta")
+	(( ${#specs[@]} )) || { echo "volta:  nothing for host '$host'"; return 0; }
+	local s rc=0
+	for s in "${specs[@]}"; do
+		if (( dry )); then printf 'volta would install: %s\n' "$s"; continue; fi
+		if (( ! upgrade )) && volta list "$s" --format plain 2>/dev/null | grep -q "^package $s@"; then
+			echo "volta:  $s already installed"; continue
+		fi
+		echo "volta:  install $s"; volta install "$s" || rc=1
+	done
+	return $rc
+}
+
+rc=0
+run_apt    || rc=1
+run_custom || rc=1
+run_pipx   || rc=1
+run_volta  || rc=1
+exit $rc

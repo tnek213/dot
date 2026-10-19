@@ -1,0 +1,22 @@
+[[root]]
+path = "~/.claude/skills"
+encryption = "all"
+levels = 0
+ignore = [".trash/*", "synced/*"]
+[[root]]
+path = "~/.claude/hooks"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.claude/bin"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.claude/agents"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.local/share/mail-extra"
+encryption = "content"
+levels = 0
+ignore = ["conversations/*", "__pycache__/*", "*/__pycache__/*"]

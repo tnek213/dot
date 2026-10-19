@@ -1,0 +1,18 @@
+{{- if (lookPath "pipx") -}}
+#!/usr/bin/env sh
+
+set -eu
+
+# pipx-install every tool package under tools/<name>/ (each has a pyproject.toml).
+# Re-runs whenever any packaged source file changes, via the content hashes
+# below. Directories (e.g. build/, *.egg-info/ left by pipx) are skipped.
+{{ range (glob (joinPath .chezmoi.sourceDir "tools/*/*")) -}}
+{{-   if not (stat .).isDir }}
+#   {{ . }}: {{ include . | sha256sum }}
+{{-   end }}
+{{- end }}
+for pkg in "{{ .chezmoi.sourceDir }}/tools"/*/pyproject.toml; do
+    [ -e "$pkg" ] || continue
+    pipx install --force "$(dirname "$pkg")"
+done
+{{- end -}}

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Block until a set of 5 checks, 3 seconds apart, all find pn idle.
+# A busy check ends the set; the next set starts after 20 seconds.
+# Idle means PSI "some avg10" (% of the last 10s where tasks stalled) is
+# at or below PN_IO_MAX for IO and PN_CPU_MAX for CPU.
+# Exits 0 when idle, >0 if pn cannot be reached.
+
+set -u
+
+checks=5
+check_delay=3
+set_delay=20
+io_max=${PN_IO_MAX:-10}
+cpu_max=${PN_CPU_MAX:-20}
+
+pn_pressure() {
+    ssh -o BatchMode=yes -o ConnectTimeout=10 pn \
+        'grep "^some" /proc/pressure/io /proc/pressure/cpu'
+}
+
+is_busy() {
+    local out
+    out=$(pn_pressure) || return 2
+    awk -v io_max="$io_max" -v cpu_max="$cpu_max" '
+        {
+            split($2, a, "=")
+            v[$1] = a[2]
+            n++
+        }
+        END {
+            if (n != 2) exit 2
+            io = v["/proc/pressure/io:some"]
+            cpu = v["/proc/pressure/cpu:some"]
+            exit (io > io_max || cpu > cpu_max) ? 0 : 1
+        }
+    ' <<<"$out"
+}
+
+# Returns 0 if every check in the set was idle, 1 if any was busy.
+run_set() {
+    local i rc
+    for ((i = 0; i < checks; i++)); do
+        ((i > 0)) && sleep "$check_delay"
+        is_busy
+        rc=$?
+        case $rc in
+            0) return 1 ;;
+            1) ;;
+            *)
+                echo "pn-free: cannot get pressure from pn" >&2
+                exit 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+until run_set; do
+    sleep "$set_delay"
+done
+exit 0

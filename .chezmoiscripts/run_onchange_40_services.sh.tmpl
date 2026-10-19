@@ -1,0 +1,49 @@
+{{- if (lookPath "systemctl") -}}
+
+{{- $out := (includeTemplate "helpers/globfilter" (dict
+  "glob" (joinPath .chezmoi.sourceDir "dot_config/systemd/user/**/*")
+  "includeDirs" false
+  "matchRegex" `^.*\/(.+\.(service|socket|timer|path|target|mount|automount|slice))(\.tmpl)?(\.age)?$`
+)) | trim -}}
+
+{{- if $out -}}
+{{- $lines := splitList "\n" $out -}}
+
+{{- $units := list -}}
+{{- $paths := list -}}
+{{- range $lines -}}
+  {{- $cols := splitList "|" . -}}
+  {{- $units = concat $units (list (index $cols 0)) -}}
+  {{- $paths = concat $paths (list (index $cols 1)) -}}
+{{- end -}}
+
+#!/usr/bin/env sh
+
+set -eu
+
+# Re-run when any file content under dot_config/systemd/user changes:
+{{- range $paths }}
+#   {{ . }}: {{ include . | sha256sum }}
+{{- end }}
+
+systemctl --user daemon-reload
+
+_systemctl() {
+    systemctl --user "$@" >/dev/null 2>&1 || :
+}
+
+_update() {
+    _systemctl enable "$1"
+    if _systemctl is-active --quiet "$1"; then
+        _systemctl restart "$1"
+    else
+        _systemctl start "$1"
+    fi
+}
+
+{{- range $units }}
+_update "{{ . }}"
+{{- end }}
+
+{{- end -}}
+{{- end -}}

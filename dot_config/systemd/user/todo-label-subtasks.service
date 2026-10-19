@@ -1,0 +1,13 @@
+[Unit]
+Description=Promote near-term Senare tasks, label Vikunja subtasks and waiting tasks
+Documentation=file:/home/kent/.local/bin/todo
+ConditionPathExists=%h/.local/bin/todo
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/nm-online -q --timeout=30
+ExecStart=%h/.local/bin/todo promote --yes
+ExecStart=%h/.local/bin/todo label-subtasks --prune --yes
+ExecStart=%h/.local/bin/todo label-unmet --yes
+ExecStart=%h/.local/bin/todo label-bucket Uppdrag Applied Presented --yes
+Nice=10

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chezmoi-adopt"
+version = "0.1.0"
+description = "Keep declared directory trees fully tracked by chezmoi"
+requires-python = ">=3.9"
+dependencies = ["tomlkit>=0.11"]
+
+[project.scripts]
+chezmoi-adopt = "chezmoi_adopt:main"
+
+[tool.setuptools]
+py-modules = ["chezmoi_adopt"]
