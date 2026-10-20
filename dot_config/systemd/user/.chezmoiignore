@@ -1,7 +1,3 @@
-{{- $st := stat (joinPath .chezmoi.homeDir ".dropbox-dist") -}}
-{{- if not (and $st $st.isDir) -}}
-dropbox.service
-{{- end -}}
 {{- if not (lookPath "obsidian") -}}
 obstend.service
 obstend.timer

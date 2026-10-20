@@ -56,7 +56,7 @@ A regex used to filter entries and produce the `match` part of `match|path`, whe
 
 Outputs lines like:
 
-- `dropbox.service|/home/kent/.local/share/chezmoi/dot_config/systemd/user/dropbox.service.tmpl`
+- `obstend.service|/home/kent/.local/share/chezmoi/dot_config/systemd/user/obstend.service`
 - `backup.timer|/home/kent/.local/share/chezmoi/dot_config/systemd/user/backup.timer`
 
 #### `includeDirs` (optional, default: `false`)
