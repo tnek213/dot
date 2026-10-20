@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 DEFAULT_URL = "https://todo.fasa.se"
@@ -107,7 +108,7 @@ def fmt_repeat(secs: int) -> str:
     return f"{secs}s"
 
 
-def parse_due(s: str) -> str | None:
+def parse_due(s: str, end_of_day: bool = False) -> str | None:
     s = s.strip().lower()
     if s == "none":
         return None
@@ -120,6 +121,11 @@ def parse_due(s: str) -> str | None:
             d = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
             sys.exit(f"Unknown due format '{s}'. Use: YYYY-MM-DD, tomorrow, +Nd, none")
+    # Vikunja has no date-only due date; "due on day X" means 23:59 local that day
+    if end_of_day:
+        day = d.astimezone(ZoneInfo("Europe/Stockholm")).date()
+        d = datetime(day.year, day.month, day.day, 23, 59,
+                     tzinfo=ZoneInfo("Europe/Stockholm")).astimezone(timezone.utc)
     return d.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -257,8 +263,8 @@ def to_html(text: str) -> str:
 
 def from_html(s: str) -> str:
     """Rough inverse of to_html for terminal display."""
+    s = re.sub(r"</p>\s*(<br\s*/?>\s*)*<p>", "\n\n", s)
     s = re.sub(r"<br\s*/?>", "\n", s)
-    s = re.sub(r"</p>\s*<p>", "\n\n", s)
     return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
 
 
@@ -275,7 +281,7 @@ def apply_fields(t: dict, args) -> dict:
     if args.description is not None:
         t["description"] = to_html(read_arg(args.description))
     if args.due:
-        t["due_date"] = parse_due(args.due)
+        t["due_date"] = parse_due(args.due, end_of_day=True)
     if args.start:
         t["start_date"] = parse_due(args.start)
     if args.repeat:
@@ -659,12 +665,12 @@ def cmd_comments(args):
 
 
 def cmd_comment_add(args):
-    c = api("PUT", f"/tasks/{args.id}/comments", {"comment": args.text})
+    c = api("PUT", f"/tasks/{args.id}/comments", {"comment": to_html(read_arg(args.text))})
     print(f"Added comment [{c['id']}]")
 
 
 def cmd_comment_edit(args):
-    api("POST", f"/tasks/{args.task_id}/comments/{args.comment_id}", {"comment": args.text})
+    api("POST", f"/tasks/{args.task_id}/comments/{args.comment_id}", {"comment": to_html(read_arg(args.text))})
     print(f"Updated comment [{args.comment_id}]")
 
 
@@ -783,12 +789,12 @@ def main():
 
     p = command("comment-add", cmd_comment_add, "add a comment to a task")
     p.add_argument("id", type=int, help="task id")
-    p.add_argument("text", help="comment text")
+    p.add_argument("text", help="comment text ('-' reads stdin)")
 
     p = command("comment-edit", cmd_comment_edit, "edit a comment")
     p.add_argument("task_id", type=int)
     p.add_argument("comment_id", type=int)
-    p.add_argument("text", help="new comment text")
+    p.add_argument("text", help="new comment text ('-' reads stdin)")
 
     p = command("comment-rm", cmd_comment_rm, "delete a comment")
     p.add_argument("task_id", type=int)
