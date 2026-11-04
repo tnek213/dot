@@ -20,3 +20,7 @@ path = "~/.local/share/mail-extra"
 encryption = "content"
 levels = 0
 ignore = ["conversations/*", "__pycache__/*", "*/__pycache__/*"]
+[[root]]
+path = "~/.claude/skills/kivra"
+encryption = "all"
+levels = 0
