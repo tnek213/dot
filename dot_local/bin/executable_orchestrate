@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+## orchestrate: start the coordinator that runs every todo of a Vikunja project.
+## The loop itself is the todo-run skill, this only picks the model and the
+## effort, so nothing has to be remembered at the prompt. Each todo names the
+## paths it works in, so the coordinator runs in a directory of its own per
+## project (under ~/.local/state/orchestrate), never in $PWD: a chat or repo
+## dir would load that dir's CLAUDE.md and keep the transcript there. A lock
+## in that directory stops a second coordinator for the same project.
+##
+## A project is completed when it has no open todos: `orchestrate --complete`
+## (the coordinator runs it at the end) and every coordinator exit then write
+## the file completed in its directory. A project whose description has lines
+## "After: OTHER/PROJECT" waits for those files before it starts claude, by
+## polling once a minute, so the wait costs no tokens.
+##
+## Each run gets a random color so it stands out from normal chats: a banner in
+## Claude's status line (works in any terminal, also over ssh) and a tinted
+## terminal background where the terminal understands OSC 11 (kitty, GNOME
+## Terminal, VS Code). Terminals that do not just ignore it.
+##
+##   orchestrate                     list projects with open agent todos
+##   orchestrate PROJECT             start a coordinator for PROJECT
+##   orchestrate --resume            list coordinator sessions of the last 90 days
+##   orchestrate --resume PROJECT    continue the newest coordinator session of PROJECT
+##   orchestrate --complete PROJECT  mark PROJECT completed, fails while it has open todos
+##   orchestrate --help              print the usage line
+set -euo pipefail
+
+usage="usage: orchestrate [PROJECT] | --resume [PROJECT] | --complete PROJECT | --help"
+## Claude Code deletes transcripts after cleanupPeriodDays (set to 90 in settings.json)
+keep_days=90
+state_root=${XDG_STATE_HOME:-$HOME/.local/state}/orchestrate
+poll_seconds=60
+
+dir_of() {
+    printf '%s/%s' "$state_root" "$(printf %s "$1" | tr -c 'A-Za-z0-9._-' -)"
+}
+
+complete() {
+    local open
+    open=$(todo list -p "$1")
+    if [ "$open" != "No open tasks." ]; then
+        echo "orchestrate: $1 still has open todos" >&2
+        return 1
+    fi
+    mkdir -p "$(dir_of "$1")"
+    date '+%F %T' >"$(dir_of "$1")/completed"
+    echo "orchestrate: $1 is completed"
+}
+
+## hue in degrees, saturation and lightness in percent, prints #rrggbb
+hsl() {
+    awk -v h="$1" -v s="$2" -v l="$3" '
+        function f(n,   k, a, m) {
+            k = (n + h / 30) % 12
+            a = s * (l < 1 - l ? l : 1 - l)
+            m = k - 3
+            if (9 - k < m) m = 9 - k
+            if (m > 1) m = 1
+            if (m < -1) m = -1
+            return l - a * m
+        }
+        BEGIN { s /= 100; l /= 100; printf "#%02x%02x%02x", f(0) * 255 + .5, f(8) * 255 + .5, f(4) * 255 + .5 }'
+}
+
+## one line per session, newest first: mtime, project, session id, the cwd it started in
+sessions() {
+    find ~/.claude/projects -maxdepth 2 -name '*.jsonl' -mtime "-$keep_days" -printf '%T@ %p\n' |
+        sort -rn |
+        while read -r mtime file; do
+            title=$(grep -m1 -o '"customTitle":"orchestrate [^"]*"' "$file") || continue
+            cwd=$(grep -m1 -o '"cwd":"[^"]*"' "$file") || continue
+            printf '%s\t%s\t%s\t%s\n' "${mtime%.*}" "${title#*orchestrate }" \
+                "$(basename "$file" .jsonl)" "${cwd#*:}"
+        done | sed 's/"//g'
+}
+
+case "${1:-}" in
+    -h | --help)
+        echo "$usage"
+        exit 0
+        ;;
+    --complete | --resume) name=${2:-} ;;
+    *) name=${1:-} ;;
+esac
+## todo orchestrable answers a flag with its help and exit 0, which would start
+## a coordinator with the flag as its project
+case "$name" in
+    -*)
+        echo "orchestrate: not a project: $name" >&2
+        echo "$usage" >&2
+        exit 2
+        ;;
+esac
+
+if [ "${1:-}" = --complete ]; then
+    [ $# -eq 2 ] || { echo "$usage" >&2; exit 2; }
+    todo project-show "$2" >/dev/null
+    complete "$2"
+    exit
+fi
+
+resume_id=
+if [ "${1:-}" = --resume ]; then
+    if [ $# -eq 1 ]; then
+        sessions | while IFS=$'\t' read -r mtime project id cwd; do
+            printf '%s  %-20s %s  %s\n' "$(date -d "@$mtime" '+%F %R')" "$project" "$id" "$cwd"
+        done
+        exit 0
+    fi
+    [ $# -eq 2 ] || { echo "$usage" >&2; exit 2; }
+    project=$2
+    line=$(sessions | awk -F'\t' -v p="$project" '$2 == p { print; exit }')
+    if [ -z "$line" ]; then
+        echo "orchestrate: no session for $project in the last $keep_days days" >&2
+        exit 1
+    fi
+    IFS=$'\t' read -r _ _ resume_id resume_cwd <<<"$line"
+else
+    ## with no project, list what can be orchestrated
+    if [ $# -eq 0 ]; then
+        exec todo orchestrable
+    fi
+    [ $# -eq 1 ] || { echo "$usage" >&2; exit 2; }
+    project=$1
+    ## only projects planned for agents, so a typo or Inbox never starts a run
+    todo orchestrable "$project" >/dev/null
+fi
+
+run_dir=$(dir_of "$project")
+mkdir -p "$run_dir"
+## held until this script exits, claude gets the fd closed (9>&- below) so a
+## detached worker process can never keep the lock alive after the run
+exec 9>"$run_dir/lock"
+if ! flock -n 9; then
+    echo "orchestrate: a coordinator for $project is already running" >&2
+    exit 1
+fi
+## it has open todos again, so an old marker would be a lie
+[ -n "$resume_id" ] || rm -f "$run_dir/completed"
+
+needs=()
+if [ -z "$resume_id" ]; then
+    while read -r key dep; do
+        [ "$key" = After: ] || continue
+        todo project-show "$dep" >/dev/null
+        needs+=("$dep")
+    done < <(todo project-show "$project")
+fi
+## claude only finds a session from the directory it was started in, so a
+## session from before the run dirs existed resumes where it started
+cd "${resume_cwd:-$run_dir}"
+
+## any hue, a dark and muted background so Claude's dark theme fits, the
+## banner accent the same hue but light
+hue=$((RANDOM % 360))
+bg=$(hsl "$hue" $((30 + RANDOM % 30)) $((7 + RANDOM % 6)))
+accent=$(hsl "$hue" 80 72)
+rgb() { printf '%d;%d;%d' "0x${1:1:2}" "0x${1:3:2}" "0x${1:5:2}"; }
+
+banner="printf '\\033[1;38;2;0;0;0;48;2;$(rgb "$accent")m orchestrate %s \\033[0m' $(printf %q "$project")"
+limits='l=$(~/.claude/bin/claude-statusline); [ -z "$l" ] || printf " %s" "$l"'
+settings=$(jq -cn --arg cmd "$banner; $limits" '{statusLine: {type: "command", command: $cmd, refreshInterval: 60}}')
+
+## tmux and screen swallow or mangle OSC 11, the linux console has no use for it
+if [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${STY:-}" ] && [ "${TERM:-dumb}" != dumb ] && [ "${TERM:-}" != linux ]; then
+    settings=$(jq -c '. + {theme: "dark"}' <<<"$settings")
+    printf '\033]11;%s\007' "$bg"
+    ## OSC 111 puts the terminal's own background back
+    trap 'printf "\033]111\007"' EXIT
+fi
+
+if [ ${#needs[@]} -gt 0 ]; then
+    echo "orchestrate: $project starts after ${needs[*]}"
+    echo "  checks every $poll_seconds s with no AI and no tokens, Ctrl-C stops"
+    started=$(date +%s)
+    while :; do
+        left=()
+        for dep in "${needs[@]}"; do
+            [ -e "$(dir_of "$dep")/completed" ] || left+=("$dep")
+        done
+        [ ${#left[@]} -gt 0 ] || break
+        line="  waiting for ${left[*]}, $((($(date +%s) - started) / 60)) min so far, next check $(date -d "+$poll_seconds sec" +%R)"
+        if [ -t 1 ]; then
+            printf '\r\033[K%s' "$line"
+        else
+            echo "$line"
+        fi
+        sleep "$poll_seconds"
+    done
+    [ -t 1 ] && printf '\r\033[K'
+    echo "orchestrate: ${needs[*]} completed, starting $project"
+fi
+
+## the coordinator wraps up at 95% weekly use, show where we start from
+claude-usage 2>&1 | grep '^weekly ' || true
+
+## the workers inherit this mode, and a permission prompt nobody answers would
+## stall the whole run
+status=0
+if [ -n "$resume_id" ]; then
+    claude --dangerously-skip-permissions --model opus --effort high \
+        --resume "$resume_id" --settings "$settings" 9>&- || status=$?
+else
+    claude --dangerously-skip-permissions --model opus --effort high \
+        -n "orchestrate $project" --settings "$settings" "Run the $project todos." 9>&- || status=$?
+fi
+
+## a coordinator that forgot --complete still unblocks the projects after it
+complete "$project" 2>/dev/null || true
+exit "$status"
