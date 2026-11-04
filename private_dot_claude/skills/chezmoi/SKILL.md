@@ -18,11 +18,11 @@ touching `.hooks/`, template work, and any repair needing judgement.
 
 A managed file is in one of three states:
 
-| State | Source form | Content in git | Name/path in git |
-|---|---|---|---|
-| plain | `dot_foo` | visible | visible |
-| encrypted | `encrypted_foo.age` | hidden | visible |
-| crypt | `crypt/<id>.age` + `crypt/<id>.yaml.age` | hidden | hidden |
+| State     | Source form                              | Content in git | Name/path in git |
+| --------- | ---------------------------------------- | -------------- | ---------------- |
+| plain     | `dot_foo`                                | visible        | visible          |
+| encrypted | `encrypted_foo.age`                      | hidden         | visible          |
+| crypt     | `crypt/<id>.age` + `crypt/<id>.yaml.age` | hidden         | hidden           |
 
 `crypt` is the custom scheme: git holds only a random-id blob pair; the
 real source path lives in the encrypted `.yaml.age` sidecar and is
@@ -70,7 +70,7 @@ chezmoi cryptpath to-encrypted FILE...       # → encrypted_*.age, clear path
 chezmoi cryptpath to-unencrypted FILE...     # → plain
 ```
 
-`to-encrypted-path` is the only way *into* crypt; the other two
+`to-encrypted-path` is the only way _into_ crypt; the other two
 downgrade out of it (crypt entry dropped, file kept at its clear source
 path). `--pattern[1|2|3] P` on `to-encrypted-path` records
 `remoteUrlPattern*` metadata for git `includeIf hasconfig:` templating
@@ -117,7 +117,7 @@ that workflow is the `vscode-settings` skill.
 ## Always verify after a mutation
 
 Every one of these commands can leave the metadata and the working tree
-disagreeing without saying so. After *any* add/adopt/move/convert/forget,
+disagreeing without saying so. After _any_ add/adopt/move/convert/forget,
 before reporting success:
 
 ```sh
