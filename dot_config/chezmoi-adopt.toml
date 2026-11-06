@@ -2,7 +2,7 @@
 path = "~/.claude/skills"
 encryption = "all"
 levels = 0
-ignore = [".trash/*", "synced/*"]
+ignore = [".trash/*", "synced/*", "__pycache__/*", "*/__pycache__/*"]
 [[root]]
 path = "~/.claude/hooks"
 encryption = "all"
