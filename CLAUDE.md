@@ -46,7 +46,5 @@ absent from source.
 - Markdown is linted via `.markdownlint-cli2.jsonc`.
 - Shell config is split into `dot_bashrc` + numbered drop-ins in
   `dot_bashrc.d/`, sourced in filename order.
-- `dot_config/aictx/` configures the `aictx` tool (defined in
-  `dot_bashrc.d/private_50_aictx.bash`): `types/` is the chat-type taxonomy,
-  `template/` is the per-chat scaffold, `parts-rules.md`/`slug-rules.md` are
-  splitting/naming rules.
+- `aictx` lives in its own repo (`wip/aictx`, checked out at `~/Documents/aictx`).
+  `dot_bashrc.d/private_50_aictx.bash` only sources its `src/aictx.bash`.
