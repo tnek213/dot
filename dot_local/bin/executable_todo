@@ -389,6 +389,31 @@ def cmd_project_edit(args):
     print(f"Updated project [{pid}] {p['title']}")
 
 
+def cmd_project_rm(args):
+    """Delete a project, but only an empty one: Vikunja takes tasks and subprojects with it."""
+    pid = resolve_project(args.project)
+    by_id = {p["id"]: p for p in api_all("/projects", is_archived="true")}
+    path = project_path(pid, by_id)
+    if str(CFG.get("default_project")) == str(pid):
+        sys.exit(f"Refusing to delete [{pid}] {path}: it is the default project.")
+    subs = [p for p in by_id.values() if p.get("parent_project_id") == pid]
+    if subs:
+        archived = sum(1 for p in subs if p.get("is_archived"))
+        sys.exit(f"Refusing to delete [{pid}] {path}: it has {len(subs)} subproject(s) "
+                 f"({archived} archived). Only empty projects can be deleted.")
+    tasks = api_all(f"/projects/{pid}/tasks", filter="done = true || done = false")
+    if tasks:
+        done = sum(1 for t in tasks if t.get("done"))
+        sys.exit(f"Refusing to delete [{pid}] {path}: it has {len(tasks)} task(s) "
+                 f"({len(tasks) - done} open, {done} done). Only empty projects can be deleted.")
+    if not args.yes:
+        print(f"Would delete: [{pid}] {path}")
+        print("\n1 project to delete, re-run with --yes to apply.")
+        return
+    api("DELETE", f"/projects/{pid}")
+    print(f"Deleted: [{pid}] {path}")
+
+
 def cmd_default(args):
     CFG["default_project"] = resolve_project(args.project)
     save_config()
@@ -786,8 +811,8 @@ def main():
     parser = argparse.ArgumentParser(prog="todo", description="Vikunja task manager CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def command(name, func, help):
-        p = sub.add_parser(name, help=help)
+    def command(name, func, help, **kwargs):
+        p = sub.add_parser(name, help=help, **kwargs)
         p.set_defaults(func=func)
         return p
 
@@ -814,6 +839,14 @@ def main():
     p.add_argument("--title", default=None, help="new title")
     p.add_argument("--description", "-D", default=None,
                    help="new description ('-' reads stdin, '' clears)")
+
+    p = command("project-rm", cmd_project_rm,
+                "delete an empty project (dry run without --yes)",
+                description="Delete a project. Only an empty project is deleted: it is refused "
+                            "when it has any task (open or done) or any subproject (archived "
+                            "included), and when it is the default project. No option overrides that.")
+    p.add_argument("project", help="project name, path (A/B) or id")
+    p.add_argument("--yes", action="store_true", help="actually delete")
 
     command("default", cmd_default, "set default project").add_argument(
         "project", help="project name or id")

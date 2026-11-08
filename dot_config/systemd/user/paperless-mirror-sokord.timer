@@ -1,0 +1,11 @@
+[Unit]
+Description=Mirror Paperless Sökord into content once per day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+Unit=paperless-mirror-sokord.service
+
+[Install]
+WantedBy=timers.target

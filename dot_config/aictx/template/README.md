@@ -6,7 +6,9 @@ anything worth keeping so the thread can be resumed later.
 
 ## Standard files
 
-- `.aictx` — metadata. Line 1: space-separated lowercase tags. Line 2: one-sentence summary.
+- `.aictx` — metadata maintained by `aictx`. Line 1: creation date (`YYYY-MM-DD`) followed by
+  space-separated lowercase tags (initially the slug's words, plus `archived` when archived).
+  Line 2: one-sentence summary. Line 3: usage count (`used:N lastused:YYYY-MM-DD`).
 - `CLAUDE.md` — per-chat instructions, layered on top of `../CLAUDE.md` (shared).
 - `README.md` — this file. Describes what each file in the directory is for.
 
