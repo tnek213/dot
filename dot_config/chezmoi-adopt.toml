@@ -2,7 +2,7 @@
 path = "~/.claude/skills"
 encryption = "all"
 levels = 0
-ignore = [".trash/*", "synced/*", "__pycache__/*", "*/__pycache__/*"]
+ignore = [".trash/*", "synced/*", "__pycache__/*", "*/__pycache__/*", "test_*.py", "*/test_*.py"]
 [[root]]
 path = "~/.claude/hooks"
 encryption = "all"
@@ -20,7 +20,3 @@ path = "~/.local/share/mail-extra"
 encryption = "content"
 levels = 0
 ignore = ["conversations/*", "__pycache__/*", "*/__pycache__/*"]
-[[root]]
-path = "~/.claude/skills/kivra"
-encryption = "all"
-levels = 0
