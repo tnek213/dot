@@ -1,5 +1,5 @@
 [Unit]
-Description=Mirror Paperless Sökord into content once per day
+Description=Mirror Paperless keywords into content once per day
 
 [Timer]
 OnCalendar=daily

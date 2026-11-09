@@ -1,10 +1,10 @@
 [Unit]
-Description=Copy each Paperless Sökord field last into the document content
+Description=Copy each Paperless keywords field last into the document content
 Documentation=file:/home/kent/.claude/skills/paperless/SKILL.md
-ConditionPathExists=%h/.claude/skills/paperless/paperless.py
+ConditionPathExists=%h/.claude/skills/paperless/scripts/paperless.py
 
 [Service]
 Type=oneshot
 ExecCondition=/usr/bin/nm-online -q --timeout=30
-ExecStart=%h/.local/bin/uv run -q %h/.claude/skills/paperless/paperless.py mirror-sokord
+ExecStart=%h/.local/bin/uv run -q %h/.claude/skills/paperless/scripts/paperless.py mirror-keywords
 Nice=10
