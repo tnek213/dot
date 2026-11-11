@@ -43,34 +43,59 @@ def check_store():
         raise ValueError("Seafile conflict copies exist in the user data store")
 
 
-def scope_path(scope):
+KINDS = ("preference", "state")
+
+
+def scope_path(scope, kind="preference"):
     # The hash keeps scopes apart that differ only in case or filtered characters.
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
     name = re.sub(r"[^-a-z0-9]", "", scope.lower())
-    return STORE / (f"{name}.{digest}.json" if name else f"{digest}.json")
+    stem = f"{name}.{digest}" if name else digest
+    return STORE / (f"{stem}.json" if kind == "preference" else f"{stem}.{kind}.json")
 
 
-def read_scope(scope):
-    path = scope_path(scope)
+def read_document(path):
     if path.is_symlink():
         raise ValueError("User data scope files must not be symlinks")
-    try:
-        content = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    data = parse_json(content)
+    data = parse_json(path.read_text(encoding="utf-8"))
     if (
         not isinstance(data, dict)
         or set(data) != {"scope", "values"}
-        or data["scope"] != scope
+        or not isinstance(data["scope"], str)
         or not isinstance(data["values"], dict)
         or any(not key for key in data["values"])
     ):
         raise ValueError("Invalid user data scope document")
+    return data
+
+
+def read_scope(scope, kind="preference"):
+    path = scope_path(scope, kind)
+    try:
+        data = read_document(path)
+    except FileNotFoundError:
+        return {}
+    if data["scope"] != scope:
+        raise ValueError("Invalid user data scope document")
     return data["values"]
 
 
-def write_scope(scope, values):
+def list_scopes(kind):
+    suffix = ".state.json" if kind == "state" else ".json"
+    scopes = []
+    for path in STORE.iterdir():
+        if path.name.startswith(".pending-") or not path.name.endswith(suffix):
+            continue
+        if kind == "preference" and path.name.endswith(".state.json"):
+            continue
+        scope = read_document(path)["scope"]
+        if scope_path(scope, kind) != path:
+            raise ValueError(f"User data file does not match its scope: {path.name}")
+        scopes.append(scope)
+    return sorted(scopes)
+
+
+def write_scope(scope, values, kind="preference"):
     content = (
         json.dumps(
             {"scope": scope, "values": values},
@@ -90,7 +115,7 @@ def write_scope(scope, values):
             output.flush()
             os.fsync(output.fileno())
         check_store()
-        os.replace(temporary, scope_path(scope))
+        os.replace(temporary, scope_path(scope, kind))
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -106,8 +131,10 @@ def execute(args):
     with os.fdopen(descriptor, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         check_store()
-        values = read_scope(args.scope)
-        result = {"scope": args.scope}
+        if args.command == "scopes":
+            return {"kind": args.kind, "scopes": list_scopes(args.kind)}, 0
+        values = read_scope(args.scope, args.kind)
+        result = {"scope": args.scope, "kind": args.kind}
         if args.command == "list":
             result["values"] = values
             return result, 0
@@ -119,12 +146,12 @@ def execute(args):
             result["value"] = values[args.key]
         elif args.command == "set":
             values[args.key] = args.value
-            write_scope(args.scope, values)
+            write_scope(args.scope, values, args.kind)
         elif args.command == "delete":
             result["deleted"] = args.key in values
             if result["deleted"]:
                 del values[args.key]
-                write_scope(args.scope, values)
+                write_scope(args.scope, values, args.kind)
         return result, 0
 
 
@@ -137,8 +164,11 @@ def identifier(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("get", "set", "list", "delete"):
+    for name in ("get", "set", "list", "delete", "scopes"):
         command = commands.add_parser(name)
+        command.add_argument("--kind", choices=KINDS, default="preference")
+        if name == "scopes":
+            continue
         command.add_argument("--scope", required=True, type=identifier)
         if name != "list":
             command.add_argument("--key", required=True, type=identifier)

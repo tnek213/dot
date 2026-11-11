@@ -20,3 +20,19 @@ path = "~/.local/share/mail-extra"
 encryption = "content"
 levels = 0
 ignore = ["conversations/*", "__pycache__/*", "*/__pycache__/*"]
+[[root]]
+path = "~/.claude/rules"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.claude/output-styles"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.claude/themes"
+encryption = "all"
+levels = 0
+[[root]]
+path = "~/.claude/workflows"
+encryption = "all"
+levels = 0
