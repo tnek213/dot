@@ -1,0 +1,8 @@
+# ignore everything
+*
+
+# including this directory
+.
+
+# except the .chezmoidata subdirectory
+!/.chezmoidata/

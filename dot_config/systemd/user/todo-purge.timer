@@ -1,0 +1,11 @@
+[Unit]
+Description=Purge old completed Vikunja tasks once per day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+Unit=todo-purge.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=com.seafile.Client
+X-XDP-Autostart=com.seafile.Client
+Exec=flatpak run com.seafile.Client
+X-Flatpak=com.seafile.Client

@@ -1,0 +1,5 @@
+# Python build artifacts left in-tree by `pipx install <dir>`
+*/build/
+*/dist/
+*/*.egg-info/
+**/__pycache__/

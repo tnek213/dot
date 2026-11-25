@@ -1,0 +1,12 @@
+[Unit]
+Description=Label Vikunja subtasks and waiting tasks (every 30 min, 06:00–02:00)
+
+[Timer]
+OnCalendar=*-*-* 00,01,06..23:00,30
+OnCalendar=*-*-* 02:00
+RandomizedDelaySec=2min
+Persistent=true
+Unit=todo-label-subtasks.service
+
+[Install]
+WantedBy=timers.target

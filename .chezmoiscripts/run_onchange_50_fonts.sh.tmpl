@@ -1,0 +1,37 @@
+{{- if and (or .gui false) (lookPath "fc-cache") -}}
+
+{{- $out := (includeTemplate "helpers/globfilter" (dict
+  "glob" (joinPath .chezmoi.sourceDir "dot_local/share/fonts/**/*")
+  "includeDirs" false
+  "matchRegex" `^(.+\.(ttf|otf)(\.age)?)$`
+)) | trim -}}
+
+{{- if $out -}}
+{{- $lines := splitList "\n" $out -}}
+
+{{- $paths := list -}}
+{{- range $lines -}}
+  {{- $paths = concat $paths (list (index (splitList "|" .) 1)) -}}
+{{- end -}}
+
+#!/usr/bin/env sh
+
+set -eu
+
+# Re-run when any font file content changes:
+{{- range $paths }}
+#   {{ . }}: {{ include . | sha256sum }}
+{{- end }}
+
+fc-cache -f
+
+{{- if (lookPath "flatpak") }}
+
+flatpak override --user --filesystem=xdg-data/fonts:ro
+
+for appid in $(flatpak list --app --columns=application); do
+  rm -rf ~/.var/app/"$appid"/cache/fontconfig
+done
+{{- end -}}
+{{- end -}}
+{{- end -}}

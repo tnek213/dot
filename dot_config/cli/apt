@@ -1,0 +1,71 @@
+[*]
+# core CLI
+git
+curl
+rsync
+tree
+# CLI tools
+htop
+ncdu
+bat
+fzf
+nnn
+lazygit
+tealdeer
+# data / utils
+yq
+sqlite3
+xxd
+zip
+fdupes
+dialog
+asciinema
+ansifilter
+# network / remote
+nmap
+whois
+sshpass
+rclone
+# python (bootstraps ~/.config/cli/pipx)
+pipx
+python3-pip
+
+[swift]
+# desktop / GUI
+kitty
+gedit
+gnumeric
+gnome-screenshot
+flatpak
+gnome-software-plugin-flatpak
+wl-clipboard
+gnome-shell-extension-appindicator
+gnome-shell-extension-hide-activities
+gnome-shell-extension-manager
+# remote desktop
+remmina
+remmina-plugin-vnc
+# secrets / keyring
+libsecret-tools
+# fonts
+fonts-hack
+fonts-ibm-plex
+ttf-mscorefonts-installer
+xfonts-utils
+# OCR / documents
+ocrmypdf
+tesseract-ocr-swe
+imagemagick
+img2pdf
+catdoc
+# spelling
+hunspell-sv
+# calculator
+qalc
+# languages
+clojure
+# hardware / per-machine
+nvme-cli
+printer-driver-brlaser
+zram-tools
+systemd-oomd

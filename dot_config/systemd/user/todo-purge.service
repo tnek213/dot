@@ -1,0 +1,10 @@
+[Unit]
+Description=Delete Vikunja tasks completed more than 20 days ago
+Documentation=file:/home/kent/.local/bin/todo
+ConditionPathExists=%h/.local/bin/todo
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/nm-online -q --timeout=30
+ExecStart=%h/.local/bin/todo purge --older-than 20d --yes
+Nice=10

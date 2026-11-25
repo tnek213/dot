@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Print the plan usage limits of the logged-in Claude account, one per line:
+#   weekly 91% resets Tue 2026-11-03 15:00
+# Uses the endpoint /usage in Claude Code reads. It is not a public API, so
+# it may change. Exits 1 with a message when the numbers cannot be read.
+set -euo pipefail
+
+tok=$(jq -r '.claudeAiOauth.accessToken // empty' ~/.claude/.credentials.json 2>/dev/null || true)
+if [ -z "$tok" ]; then
+	echo "usage unknown: no Claude login in ~/.claude/.credentials.json" >&2
+	exit 1
+fi
+
+if ! json=$(curl -sf --max-time 15 https://api.anthropic.com/api/oauth/usage \
+	-H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20"); then
+	echo "usage unknown: the usage endpoint did not answer (expired login or changed API)" >&2
+	exit 1
+fi
+
+lines=$(jq -r '.limits[]? | [
+	(if .kind == "weekly_scoped" then "weekly \(.scope.model.display_name // "scoped")"
+	 else .group end),
+	(.percent | tostring), (.resets_at // "")] | @tsv' <<<"$json")
+if [ -z "$lines" ]; then
+	echo "usage unknown: no limits in the answer" >&2
+	exit 1
+fi
+
+while IFS=$'\t' read -r name pct reset; do
+	when=""
+	[ -n "$reset" ] && when=" resets $(LC_ALL=C date -d "$reset" '+%a %Y-%m-%d %H:%M')"
+	echo "$name $pct%$when"
+done <<<"$lines"

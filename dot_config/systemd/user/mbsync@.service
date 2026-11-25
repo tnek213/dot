@@ -1,0 +1,12 @@
+[Unit]
+Description=mbsync sync of %i
+Documentation=man:mbsync(1)
+ConditionPathExists=%h/.config/isyncrc
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/nm-online -q --timeout=30
+ExecStart=%h/.local/share/mail-extra/sync %i
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

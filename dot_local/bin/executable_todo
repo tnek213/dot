@@ -1,0 +1,1786 @@
+#!/usr/bin/env python3
+"""todo — task manager CLI for Vikunja, and for GitHub and Forgejo issues of mapped repos."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from pathlib import Path
+
+DEFAULT_URL = "https://todo.fasa.se"
+CONFIG_PATH = Path.home() / ".config" / "vikunja" / "config.json"
+PURGED_PATH = Path.home() / ".local" / "share" / "todo" / "purged.jsonl"
+PER_PAGE = 50
+# (name, suffix, seconds) — used for both parsing and formatting repeat intervals
+REPEAT_UNITS = (
+    ("yearly", "y", 31536000),
+    ("monthly", "m", 2592000),
+    ("weekly", "w", 604800),
+    ("daily", "d", 86400),
+)
+# Relation kinds, seen from a task, whose other task must be done first.
+PREREQ_KINDS = ("blocked", "follows")
+DEPENDENT_KINDS = ("blocking", "precedes")
+# Counts at or above this share one label, e.g. unfulfilled5plus ('+' breaks filters).
+UNMET_CAP = 5
+
+CFG: dict = {}
+
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    return json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+
+
+def save_config() -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(CFG, indent=2))
+    CONFIG_PATH.chmod(0o600)
+
+
+# ── api ───────────────────────────────────────────────────────────────────────
+
+def request(method: str, url: str, body=None, headers: dict | None = None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json", **(headers or {})},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            raw = json.loads(raw).get("message", raw)
+        except ValueError:
+            pass
+        sys.exit(f"API error {e.code}: {raw}")
+
+
+def api(method: str, path: str, body=None, **params):
+    if not CFG.get("token"):
+        sys.exit("Not logged in. Run: todo login")
+    url = CFG.get("url", DEFAULT_URL).rstrip("/") + "/api/v1" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return request(method, url, body, {"Authorization": f"Bearer {CFG['token']}"})
+
+
+def api_all(path: str, **params) -> list:
+    """GET every page of a paginated collection (the API caps per_page)."""
+    out: list = []
+    for page in range(1, 1000):
+        chunk = api("GET", path, page=page, per_page=PER_PAGE, **params) or []
+        out += chunk
+        if len(chunk) < PER_PAGE:
+            return out
+    return out
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def parse_repeat(s: str) -> int:
+    s = s.strip().lower()
+    for name, suffix, secs in REPEAT_UNITS:
+        if s == name:
+            return secs
+        if s[-1:] == suffix and s[:-1].isdigit():
+            return int(s[:-1]) * secs
+    sys.exit(f"Unknown repeat format '{s}'. Use: daily, weekly, monthly, yearly, Nd, Nw, Nm, Ny")
+
+
+def fmt_repeat(secs: int) -> str:
+    for name, suffix, unit in REPEAT_UNITS:
+        n, rest = divmod(secs, unit)
+        if rest == 0:
+            return name if n == 1 else f"every {n}{suffix}"
+    return f"{secs}s"
+
+
+def parse_due(s: str, end_of_day: bool = False) -> str | None:
+    s = s.strip().lower()
+    if s == "none":
+        return None
+    if s == "tomorrow":
+        d = datetime.now(timezone.utc) + timedelta(days=1)
+    elif s.startswith("+") and s[1:].rstrip("d").isdigit():
+        d = datetime.now(timezone.utc) + timedelta(days=int(s[1:].rstrip("d")))
+    else:
+        try:
+            d = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            sys.exit(f"Unknown due format '{s}'. Use: YYYY-MM-DD, tomorrow, +Nd, none")
+    # Vikunja has no date-only due date; "due on day X" means 23:59 local that day
+    if end_of_day:
+        day = d.astimezone(ZoneInfo("Europe/Stockholm")).date()
+        d = datetime(day.year, day.month, day.day, 23, 59,
+                     tzinfo=ZoneInfo("Europe/Stockholm")).astimezone(timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve_project(name: str | None) -> int:
+    projects = api_all("/projects")
+    if not projects:
+        sys.exit("No projects found.")
+    if name is None:
+        name = CFG.get("default_project")
+        if name is None:
+            if len(projects) == 1:
+                return projects[0]["id"]
+            names = ", ".join(f"{p['title']} (id={p['id']})" for p in projects)
+            sys.exit(f"Multiple projects — specify --project. Available: {names}")
+    for p in projects:
+        if str(p["id"]) == str(name):
+            return p["id"]
+    # "Orchestra/Dropbox1026/Init" names a subproject by its path, matched from the end.
+    want = [part.strip().lower() for part in str(name).split("/")]
+    by_id = {p["id"]: p for p in projects}
+    hits = [p for p in projects if project_path(p["id"], by_id).lower().split("/")[-len(want):] == want]
+    if len(hits) == 1:
+        return hits[0]["id"]
+    if hits:
+        paths = ", ".join(project_path(p["id"], by_id) for p in hits)
+        sys.exit(f"Project '{name}' is ambiguous: {paths}. Give more of the path.")
+    sys.exit(f"Project '{name}' not found.")
+
+
+def project_path(pid: int, by_id: dict[int, dict]) -> str:
+    """Titles from the top project down, joined by '/'."""
+    parts, seen = [], set()
+    while pid in by_id and pid not in seen:
+        seen.add(pid)
+        parts.append(by_id[pid]["title"])
+        pid = by_id[pid].get("parent_project_id") or 0
+    return "/".join(reversed(parts))
+
+
+def project_ids(name: str | None) -> list[int]:
+    """One project, or every real project when name is 'all'.
+
+    Saved filters are returned by /projects too, with negative ids; their tasks
+    live in the real projects, so including them would visit tasks twice.
+    """
+    if name == "all":
+        return [p["id"] for p in api_all("/projects") if p["id"] > 0]
+    return [resolve_project(name)]
+
+
+def kanban_buckets(project_id: int) -> tuple[dict[int, str], dict[int, int]]:
+    """Return ({bucket_id: title}, {task_id: bucket_id}) for the kanban view."""
+    views = api("GET", f"/projects/{project_id}/views") or []
+    view = next((v for v in views if v.get("view_kind") == "kanban"), None)
+    if not view:
+        return {}, {}
+    data = api("GET", f"/projects/{project_id}/views/{view['id']}/tasks", per_page=PER_PAGE) or []
+    titles = {b["id"]: b.get("title", str(b["id"])) for b in data}
+    where = {t["id"]: b["id"] for b in data for t in (b.get("tasks") or [])}
+    return titles, where
+
+
+def kanban_view_id(project_id: int) -> int:
+    views = api("GET", f"/projects/{project_id}/views") or []
+    view = next((v for v in views if v.get("view_kind") == "kanban"), None)
+    if not view:
+        sys.exit("No kanban view found for this project.")
+    return view["id"]
+
+
+def resolve_bucket(buckets: dict[int, str], name: str) -> int:
+    """Find bucket id by case-insensitive name prefix."""
+    for bid, title in buckets.items():
+        if title.lower().startswith(name.lower()):
+            return bid
+    sys.exit(f"Bucket '{name}' not found. Available: {', '.join(buckets.values())}")
+
+
+def fmt_task(t: dict, indent: int = 0, buckets: dict | None = None) -> str:
+    # The web UI shows the per-project index (#5); every command takes the global id.
+    ref = f"{t['id']} #{t['index']}" if t.get("index") else str(t["id"])
+    parts = [f"{'  ' * indent}{'✓' if t.get('done') else '○'} [{ref}] {t['title']}"]
+    if t.get("due_date") and not t["due_date"].startswith("0001"):
+        parts.append("  due:" + t["due_date"][:10])
+    if t.get("start_date") and not t["start_date"].startswith("0001"):
+        parts.append("  start:" + t["start_date"][:10])
+    if t.get("repeat_after", 0) > 0:
+        parts.append("  repeat:" + fmt_repeat(t["repeat_after"]))
+    if buckets:
+        name = buckets.get(t.get("bucket_id", 0), "")
+        if name and name.lower() not in ("to-do", "todo", "done"):
+            parts.append(f"  [{name}]")
+    return "".join(parts)
+
+
+def related(t: dict, kinds: tuple[str, ...]) -> list[dict]:
+    rel = t.get("related_tasks") or {}
+    return [x for k in kinds for x in rel.get(k) or []]
+
+
+def blocked_depth(task_id: int, by_id: dict[int, dict], memo: dict[int, int]) -> int:
+    """Length of the longest chain of open tasks this one waits for.
+
+    If A waits for B and B for C, A has depth 2, B 1 and C 0. A done
+    prerequisite ends its chain: whatever it needed no longer matters.
+    """
+    if task_id not in memo:
+        # Placeholder, so a cycle made in the web UI ends instead of recursing forever.
+        memo[task_id] = 0
+        prereqs = [p["id"] for p in related(by_id.get(task_id, {}), PREREQ_KINDS)
+                   if not by_id.get(p["id"], p).get("done")]
+        memo[task_id] = 1 + max((blocked_depth(p, by_id, memo) for p in prereqs), default=-1)
+    return memo[task_id]
+
+
+def open_tasks_everywhere() -> dict[int, dict]:
+    """Open tasks of every project by id, since a prerequisite can live in another project."""
+    return {t["id"]: t for pid in project_ids("all")
+            for t in api_all(f"/projects/{pid}/tasks", filter="done = false")}
+
+
+def depends_on(task_id: int, target: int) -> bool:
+    """True if task_id already (transitively) waits for target."""
+    stack, seen = [task_id], set()
+    while stack:
+        tid = stack.pop()
+        if tid == target:
+            return True
+        if tid not in seen:
+            seen.add(tid)
+            stack += [p["id"] for p in related(api("GET", f"/tasks/{tid}"), PREREQ_KINDS)]
+    return False
+
+
+def add_prereq(task_id: int, prereq_id: int) -> None:
+    if task_id == prereq_id or depends_on(prereq_id, task_id):
+        sys.exit(f"[{prereq_id}] already waits for [{task_id}]; that would be a cycle.")
+    api("PUT", f"/tasks/{prereq_id}/relations",
+        {"other_task_id": task_id, "relation_kind": "blocking"})
+
+
+def read_arg(s: str) -> str:
+    """Return the argument, or stdin if it is '-'."""
+    return sys.stdin.read() if s == "-" else s
+
+
+def to_html(text: str) -> str:
+    """Vikunja stores descriptions as HTML; keep plain-text line breaks intact."""
+    text = text.strip()
+    if not text or ("<" in text and ">" in text):
+        return text
+    blocks = []
+    for block in text.split("\n\n"):
+        lines = [html.escape(line) for line in block.strip().split("\n") if line.strip()]
+        if lines:
+            blocks.append("<p>" + "<br>".join(lines) + "</p>")
+    return "".join(blocks)
+
+
+def from_html(s: str) -> str:
+    """Rough inverse of to_html for terminal display."""
+    s = re.sub(r"</p>\s*(<br\s*/?>\s*)*<p>", "\n\n", s)
+    s = re.sub(r"<br\s*/?>", "\n", s)
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+def fmt_comment(c: dict) -> str:
+    author = c.get("author", {}).get("username", "?")
+    text = from_html(c["comment"]).replace("\n", "\n      ")
+    return f"  [{c['id']}] {c.get('created', '')[:10]} {author}: {text}"
+
+
+def apply_fields(t: dict, args) -> dict:
+    """Copy the shared --title/--description/--due/--repeat options onto a task."""
+    if getattr(args, "title", None):
+        t["title"] = args.title
+    if args.description is not None:
+        t["description"] = to_html(read_arg(args.description))
+    if args.due:
+        t["due_date"] = parse_due(args.due, end_of_day=True)
+    if args.start:
+        t["start_date"] = parse_due(args.start)
+    if args.repeat:
+        t["repeat_after"] = parse_repeat(args.repeat)
+        t["repeat_mode"] = 0
+    return t
+
+
+def confirm(args, count: int, what: str) -> bool:
+    """Gate a bulk change behind --yes; otherwise report it as a dry run."""
+    if not count:
+        print(f"Nothing to {what}.")
+        return False
+    if not args.yes:
+        print(f"\n{count} task(s) to {what} — re-run with --yes to apply.")
+        return False
+    return True
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_login(args):
+    import getpass
+    url = (args.url or CFG.get("url", DEFAULT_URL)).rstrip("/")
+    body = {"username": input("Username: "), "password": getpass.getpass("Password: ")}
+    result = request("POST", url + "/api/v1/user/login", body)
+    CFG.update(token=result["token"], url=url)
+    save_config()
+    print(f"Logged in. Token saved to {CONFIG_PATH}")
+
+
+def cmd_token(args):
+    CFG["token"] = args.token
+    if args.url:
+        CFG["url"] = args.url.rstrip("/")
+    save_config()
+    print(f"Token saved to {CONFIG_PATH}")
+
+
+def cmd_projects(args):
+    for name, repo in sorted(REPOS.items()):
+        print(f"  [{repo}] {name} (issues)")
+    params = {"is_archived": "true"} if args.archived else {}
+    projects = api_all("/projects", **params)
+    if not projects:
+        print("No projects.")
+        return
+    for p in projects:
+        marker = " *" if p["id"] == CFG.get("default_project") else ""
+        archived = " (archived)" if p.get("is_archived") else ""
+        print(f"  [{p['id']}] {p['title']}{archived}{marker}")
+
+
+def cmd_project_add(args):
+    parent = issue_path(args.parent)
+    if parent:
+        return issue_project_add(parent, args)
+    if issue_path(args.title):
+        sys.exit(f"'{args.title}' is an issue project, mapped in specific-todo:repos.")
+    body = {"title": args.title}
+    if args.parent:
+        body["parent_project_id"] = resolve_project(args.parent)
+    if args.description:
+        body["description"] = to_html(read_arg(args.description))
+    p = api("PUT", "/projects", body)
+    print(f"Created project [{p['id']}] {p['title']}")
+
+
+def cmd_project_show(args):
+    p = issue_path(args.project)
+    if p:
+        return issue_project_show(p)
+    pid = resolve_project(args.project)
+    by_id = {p["id"]: p for p in api_all("/projects", is_archived="true")}
+    print(f"[{pid}] {project_path(pid, by_id)}")
+    for line in from_html(by_id[pid].get("description") or "").splitlines():
+        print(f"  {line}" if line else "")
+    children = [p for p in by_id.values() if p.get("parent_project_id") == pid]
+    for c in sorted(children, key=lambda c: c["id"]):
+        print(f"  sub: [{c['id']}] {c['title']}" + (" (archived)" if c.get("is_archived") else ""))
+
+
+def cmd_project_edit(args):
+    p = issue_path(args.project)
+    if p:
+        return issue_project_edit(p, args)
+    pid = resolve_project(args.project)
+    p = api("GET", f"/projects/{pid}")
+    if args.title:
+        p["title"] = args.title
+    if args.description is not None:
+        p["description"] = to_html(read_arg(args.description))
+    api("POST", f"/projects/{pid}", p)
+    print(f"Updated project [{pid}] {p['title']}")
+
+
+def cmd_project_rm(args):
+    """Delete a project, but only an empty one: Vikunja takes tasks and subprojects with it."""
+    if issue_path(args.project):
+        sys.exit(f"'{args.project}' is an issue project: close its effort issue or milestone on its host.")
+    pid = resolve_project(args.project)
+    by_id = {p["id"]: p for p in api_all("/projects", is_archived="true")}
+    path = project_path(pid, by_id)
+    if str(CFG.get("default_project")) == str(pid):
+        sys.exit(f"Refusing to delete [{pid}] {path}: it is the default project.")
+    subs = [p for p in by_id.values() if p.get("parent_project_id") == pid]
+    if subs:
+        archived = sum(1 for p in subs if p.get("is_archived"))
+        sys.exit(f"Refusing to delete [{pid}] {path}: it has {len(subs)} subproject(s) "
+                 f"({archived} archived). Only empty projects can be deleted.")
+    tasks = api_all(f"/projects/{pid}/tasks", filter="done = true || done = false")
+    if tasks:
+        done = sum(1 for t in tasks if t.get("done"))
+        sys.exit(f"Refusing to delete [{pid}] {path}: it has {len(tasks)} task(s) "
+                 f"({len(tasks) - done} open, {done} done). Only empty projects can be deleted.")
+    if not args.yes:
+        print(f"Would delete: [{pid}] {path}")
+        print("\n1 project to delete, re-run with --yes to apply.")
+        return
+    api("DELETE", f"/projects/{pid}")
+    print(f"Deleted: [{pid}] {path}")
+
+
+def cmd_default(args):
+    if issue_path(args.project):
+        sys.exit("The default project must be a Vikunja project.")
+    CFG["default_project"] = resolve_project(args.project)
+    save_config()
+    print(f"Default project set to {CFG['default_project']}")
+
+
+def cmd_list(args):
+    p = issue_path(args.project)
+    if p:
+        return issue_list(p, args)
+    pid = resolve_project(args.project)
+    buckets, where = kanban_buckets(pid)
+    tasks = api_all(f"/projects/{pid}/tasks",
+                    filter="done = true || done = false" if args.all else "done = false")
+    if not tasks:
+        print("No tasks." if args.all else "No open tasks.")
+        return
+    by_id = {t["id"]: t for t in tasks}
+    for t in tasks:
+        t["bucket_id"] = where.get(t["id"], 0)
+    keep = lambda t: True
+    if args.max_blocked_depth is not None:
+        everywhere, memo = open_tasks_everywhere(), {}
+        keep = lambda t: (0 if t.get("done") else blocked_depth(t["id"], everywhere, memo)) <= args.max_blocked_depth
+    shown = [t for t in tasks if keep(t)]
+    if not shown:
+        print(f"No tasks with blocked depth {args.max_blocked_depth} or less.")
+        return
+    children = {t["id"]: (t.get("related_tasks") or {}).get("subtask", []) for t in tasks}
+    # A subtask whose parent is filtered out is listed on its own.
+    subtask_ids = {s["id"] for t in shown for s in children[t["id"]]}
+    def line(t: dict, indent: int = 0) -> str:
+        waits = [p["id"] for p in related(t, PREREQ_KINDS) if not by_id.get(p["id"], p).get("done")]
+        return fmt_task(t, indent, buckets) + (f"  after:{','.join(map(str, waits))}" if waits else "")
+
+    for t in sorted(shown, key=lambda x: x["id"]):
+        if t["id"] in subtask_ids:
+            continue
+        print(line(t))
+        for sub in sorted(children[t["id"]], key=lambda x: x["id"]):
+            sub = by_id.get(sub["id"], sub)
+            if keep(sub):
+                print(line(sub, indent=1))
+
+
+def cmd_show(args):
+    if isinstance(args.id, IssueRef):
+        return issue_show(args.id)
+    t = api("GET", f"/tasks/{args.id}")
+    buckets = kanban_buckets(t["project_id"])[0] if t.get("project_id") else {}
+    print(fmt_task(t, buckets=buckets))
+    for line in from_html(t.get("description") or "").splitlines():
+        print(f"  {line}" if line else "")
+    for rel in (t.get("related_tasks") or {}).get("subtask", []):
+        print(fmt_task(rel, indent=1, buckets=buckets))
+    for heading, kinds in (("after", PREREQ_KINDS), ("before", DEPENDENT_KINDS)):
+        rels = related(t, kinds)
+        if rels:
+            print(f"  {heading}:")
+            for rel in rels:
+                print(fmt_task(rel, indent=2))
+    comments = api("GET", f"/tasks/{args.id}/comments") or []
+    if comments:
+        print("  comments:")
+        for c in comments:
+            print(fmt_comment(c))
+
+
+def cmd_add(args):
+    p = issue_path(args.project)
+    if p:
+        return issue_add(p, args)
+    vikunja_ids([args.parent] + args.after)
+    pid = resolve_project(args.project)
+    t = api("PUT", f"/projects/{pid}/tasks", apply_fields({"title": args.title, "project_id": pid}, args))
+    if args.parent:
+        api("PUT", f"/tasks/{args.parent}/relations",
+            {"other_task_id": t["id"], "relation_kind": "subtask"})
+    for prereq in args.after:
+        add_prereq(t["id"], prereq)
+    print(f"Created: {fmt_task(t)}")
+    if args.after:
+        sync_unmet_labels(quiet=True)
+
+
+def cmd_done(args):
+    if isinstance(args.id, IssueRef):
+        return issue_done(args.id)
+    t = api("GET", f"/tasks/{args.id}")
+    api("POST", f"/tasks/{args.id}", {**t, "done": True})
+    print(f"Done: [{args.id}] {t['title']}")
+    if related(t, DEPENDENT_KINDS):
+        sync_unmet_labels(quiet=True)
+
+
+def cmd_rm(args):
+    if isinstance(args.id, IssueRef):
+        b, i = issue_of(args.id)
+        b.delete(i)
+        print(f"Deleted: [{args.id}] {i['title']}")
+        return
+    t = api("GET", f"/tasks/{args.id}")
+    api("DELETE", f"/tasks/{args.id}")
+    print(f"Deleted: [{args.id}] {t['title']}")
+
+
+def cmd_edit(args):
+    if isinstance(args.id, IssueRef):
+        return issue_edit(args.id, args)
+    t = apply_fields(api("GET", f"/tasks/{args.id}"), args)
+    if args.project:
+        if issue_path(args.project):
+            sys.exit("A Vikunja task cannot move to an issue project. Add it there and remove it here.")
+        t["project_id"] = resolve_project(args.project)
+    api("POST", f"/tasks/{args.id}", t)
+    print(f"Updated: {fmt_task(t)}")
+
+
+def cmd_bucket(args):
+    if isinstance(args.id, IssueRef):
+        return issue_bucket(args.id, args.bucket)
+    t = api("GET", f"/tasks/{args.id}")
+    pid = t["project_id"]
+    buckets = kanban_buckets(pid)[0]
+    bid = resolve_bucket(buckets, args.bucket)
+    api("POST", f"/projects/{pid}/views/{kanban_view_id(pid)}/buckets/{bid}/tasks",
+        {"task_id": args.id})
+    print(f"Moved [{args.id}] to {buckets[bid]}: {t['title']}")
+
+
+def cmd_purge(args):
+    """Delete completed tasks, optionally only those done for a while."""
+    if issue_path(args.project):
+        sys.exit(ISSUE_REFUSED.format(what="Purge"))
+    expr = "done = true"
+    if args.older_than:
+        expr += f" && done_at < now-{args.older_than}"
+    doomed = [t for pid in project_ids(args.project)
+              for t in api_all(f"/projects/{pid}/tasks", filter=expr)]
+    for t in doomed:
+        print(f"  {fmt_task(t)}")
+    if confirm(args, len(doomed), "delete"):
+        PURGED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with PURGED_PATH.open("a") as archive:
+            for t in doomed:
+                # Archive before deleting, so a failed delete never loses anything.
+                entry = {"purged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                         "task": api("GET", f"/tasks/{t['id']}"),
+                         "comments": api("GET", f"/tasks/{t['id']}/comments") or []}
+                archive.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                archive.flush()
+                api("DELETE", f"/tasks/{t['id']}")
+        print(f"Deleted {len(doomed)} task(s), archived in {PURGED_PATH}.")
+
+
+def cmd_purged(args):
+    """Search the archive of purged tasks."""
+    if not PURGED_PATH.exists():
+        sys.exit("Nothing purged yet.")
+    entries = [json.loads(line) for line in PURGED_PATH.read_text().splitlines() if line.strip()]
+    if args.id is not None:
+        match = [e for e in entries if e["task"]["id"] == args.id]
+        if not match:
+            sys.exit(f"[{args.id}] is not in the archive.")
+        print(json.dumps(match[-1], indent=2, ensure_ascii=False))
+        return
+    text = (args.text or "").lower()
+    for e in entries:
+        t = e["task"]
+        if text in json.dumps(e, ensure_ascii=False).lower():
+            print(f"  {e['purged_at'][:10]}  {fmt_task(t)}  (project {t.get('project_id')})")
+
+
+def find_or_create_label(title: str) -> int:
+    for label in api_all("/labels"):
+        if label["title"].lower() == title.lower():
+            return label["id"]
+    return api("PUT", "/labels", {"title": title})["id"]
+
+
+def cmd_label_subtasks(args):
+    """Keep a label in sync with which tasks are a subtask of another task."""
+    vikunja_project(args.project)
+    tasks = [t for pid in project_ids(args.project)
+             for t in api_all(f"/projects/{pid}/tasks")]
+    subtask_ids = {sub["id"] for t in tasks
+                   for sub in (t.get("related_tasks") or {}).get("subtask", [])}
+    label_id = find_or_create_label(args.label)
+    add, remove = [], []
+    for t in tasks:
+        labelled = any(l["id"] == label_id for l in (t.get("labels") or []))
+        if t["id"] in subtask_ids and not labelled:
+            add.append(t)
+        elif labelled and t["id"] not in subtask_ids and args.prune:
+            remove.append(t)
+    for t in add:
+        print(f"  + {fmt_task(t)}")
+    for t in remove:
+        print(f"  - {fmt_task(t)}")
+    if confirm(args, len(add) + len(remove), f"label '{args.label}'"):
+        for t in add:
+            api("PUT", f"/tasks/{t['id']}/labels", {"label_id": label_id})
+        for t in remove:
+            api("DELETE", f"/tasks/{t['id']}/labels/{label_id}")
+        print(f"Labelled {len(add)}, unlabelled {len(remove)}.")
+
+
+def unmet_label(n: int, prefix: str) -> str:
+    return f"{prefix}{UNMET_CAP}plus" if n >= UNMET_CAP else f"{prefix}{n}"
+
+
+def sync_unmet_labels(project: str = "all", prefix: str = "unfulfilled",
+                      yes: bool = True, quiet: bool = False) -> None:
+    """Label each open task with its blocked depth (see blocked_depth)."""
+    tasks = [t for pid in project_ids(project)
+             for t in api_all(f"/projects/{pid}/tasks", filter="done = true || done = false")]
+    by_id = {t["id"]: t for t in tasks}
+    memo: dict[int, int] = {}
+    existing = {l["title"].lower(): l["id"] for l in api_all("/labels")}
+    titles = [unmet_label(n, prefix) for n in range(1, UNMET_CAP + 1)]
+    ours = {existing[x.lower()]: x for x in titles if x.lower() in existing}
+    add, remove = [], []
+    for t in tasks:
+        n = 0 if t.get("done") else blocked_depth(t["id"], by_id, memo)
+        want = unmet_label(n, prefix) if n else None
+        have = {l["id"] for l in (t.get("labels") or []) if l["id"] in ours}
+        remove += [(t, lid) for lid in have if ours[lid] != want]
+        if want and want not in {ours[lid] for lid in have}:
+            add.append((t, want))
+    if not quiet:
+        for t, title in add:
+            print(f"  + {title}  {fmt_task(t)}")
+        for t, lid in remove:
+            print(f"  - {ours[lid]}  {fmt_task(t)}")
+    if not (add or remove):
+        if not quiet:
+            print("Nothing to label.")
+        return
+    if not yes:
+        print(f"\n{len(add) + len(remove)} label change(s) — re-run with --yes to apply.")
+        return
+    for t, title in add:
+        lid = existing.get(title.lower()) or find_or_create_label(title)
+        existing[title.lower()] = lid
+        api("PUT", f"/tasks/{t['id']}/labels", {"label_id": lid})
+    for t, lid in remove:
+        api("DELETE", f"/tasks/{t['id']}/labels/{lid}")
+    if not quiet:
+        print(f"Labelled {len(add)}, unlabelled {len(remove)}.")
+
+
+def cmd_label_unmet(args):
+    vikunja_project(args.project)
+    sync_unmet_labels(args.project, args.prefix, args.yes)
+
+
+def cmd_dep_add(args):
+    if isinstance(args.id, IssueRef):
+        return issue_dep(args.id, args.prereqs, add=True)
+    vikunja_ids(args.prereqs)
+    for prereq in args.prereqs:
+        add_prereq(args.id, prereq)
+        print(f"[{args.id}] now waits for [{prereq}]")
+    sync_unmet_labels(quiet=True)
+
+
+def cmd_dep_rm(args):
+    if isinstance(args.id, IssueRef):
+        return issue_dep(args.id, args.prereqs, add=False)
+    vikunja_ids(args.prereqs)
+    t = api("GET", f"/tasks/{args.id}")
+    rel = t.get("related_tasks") or {}
+    for prereq in args.prereqs:
+        kind = next((k for k in PREREQ_KINDS if any(x["id"] == prereq for x in rel.get(k) or [])), None)
+        if not kind:
+            sys.exit(f"[{args.id}] does not wait for [{prereq}].")
+        api("DELETE", f"/tasks/{args.id}/relations/{kind}/{prereq}")
+        print(f"[{args.id}] no longer waits for [{prereq}]")
+    sync_unmet_labels(quiet=True)
+
+
+def task_dates(t: dict) -> list[datetime]:
+    """Every date on a task that says when it becomes relevant."""
+    raw = [t.get(k) for k in ("due_date", "start_date", "end_date")]
+    raw += [r.get("reminder") for r in t.get("reminders") or []]
+    return [datetime.fromisoformat(d) for d in raw if d and not d.startswith("0001")]
+
+
+def vikunja_ids(ids) -> None:
+    for x in ids:
+        if isinstance(x, IssueRef):
+            sys.exit(f"[{x}] is an issue: a Vikunja task can only relate to Vikunja tasks.")
+
+
+def vikunja_project(name) -> None:
+    if issue_path(name):
+        sys.exit(f"'{name}' is an issue project: this command works on Vikunja projects only.")
+
+
+def cmd_promote(args):
+    """Move tasks out of a parked subproject (e.g. Senare) into its parent once they come close."""
+    projects = api_all("/projects")
+    parked = [p for p in projects
+              if p["title"].lower() == args.name.lower() and p.get("parent_project_id")]
+    horizon = datetime.now(timezone.utc) + timedelta(days=args.days)
+    moving: dict[int, tuple[dict, dict]] = {}
+    for p in parked:
+        tasks = api_all(f"/projects/{p['id']}/tasks", filter="done = true || done = false")
+        by_id = {t["id"]: t for t in tasks}
+        for t in tasks:
+            dates = task_dates(t)
+            # Done tasks leave too, so the parked project only holds what's still waiting.
+            if t.get("done") or (dates and min(dates) <= horizon):
+                moving[t["id"]] = (t, p)
+                # Subtasks still parked here follow their parent.
+                for sub in related(t, ("subtask",)):
+                    if sub["id"] in by_id and not task_dates(by_id[sub["id"]]):
+                        moving[sub["id"]] = (by_id[sub["id"]], p)
+    moves = list(moving.values())
+    names = {p["id"]: p["title"] for p in projects}
+    for t, p in moves:
+        print(f"  {names[p['id']]} → {names.get(p['parent_project_id'], p['parent_project_id'])}: {fmt_task(t)}")
+    if confirm(args, len(moves), "move"):
+        for t, p in moves:
+            api("POST", f"/tasks/{t['id']}", {**t, "project_id": p["parent_project_id"]})
+        print(f"Moved {len(moves)} task(s).")
+    hide_on_overview([p["id"] for p in parked], args.yes)
+
+
+def hide_on_overview(project_ids: list[int], yes: bool) -> None:
+    """Make sure the overview's saved filter excludes these projects."""
+    shown_as = api("GET", "/user")["settings"]["frontend_settings"].get("filter_id_used_on_overview")
+    if not project_ids or not shown_as or shown_as >= 0:
+        return
+    # A saved filter with id N appears as project -(N+1).
+    fid = -shown_as - 1
+    f = api("GET", f"/filters/{fid}")
+    expr = f["filters"]["filter"]
+    m = re.search(r"project not in ([\d,\s]*\d)", expr)
+    hidden = [int(x) for x in re.findall(r"\d+", m.group(1))] if m else []
+    missing = [i for i in project_ids if i not in hidden]
+    if not missing:
+        return
+    ids = ", ".join(map(str, hidden + missing))
+    expr = (expr[:m.start()] + f"project not in {ids}" + expr[m.end():] if m
+            else f"{expr} && project not in {ids}" if expr else f"project not in {ids}")
+    print(f"  overview filter {fid}: {expr}")
+    if yes:
+        f["filters"]["filter"] = expr
+        api("POST", f"/filters/{fid}", f)
+        print(f"Hid project(s) {', '.join(map(str, missing))} on the overview.")
+
+
+def cmd_label_bucket(args):
+    """Keep a label on exactly the open tasks sitting in the given kanban buckets."""
+    vikunja_project(args.project)
+    pid = resolve_project(args.project)
+    buckets, where = kanban_buckets(pid)
+    bids = {resolve_bucket(buckets, b) for b in args.buckets}
+    label_id = find_or_create_label(args.label)
+    add, remove = [], []
+    for t in api_all(f"/projects/{pid}/tasks", filter="done = true || done = false"):
+        t["bucket_id"] = where.get(t["id"], 0)
+        want = not t.get("done") and t["bucket_id"] in bids
+        labelled = any(l["id"] == label_id for l in (t.get("labels") or []))
+        if want and not labelled:
+            add.append(t)
+        elif labelled and not want:
+            remove.append(t)
+    for t in add:
+        print(f"  + {fmt_task(t, buckets=buckets)}")
+    for t in remove:
+        print(f"  - {fmt_task(t, buckets=buckets)}")
+    if confirm(args, len(add) + len(remove), f"label '{args.label}'"):
+        for t in add:
+            api("PUT", f"/tasks/{t['id']}/labels", {"label_id": label_id})
+        for t in remove:
+            api("DELETE", f"/tasks/{t['id']}/labels/{label_id}")
+        print(f"Labelled {len(add)}, unlabelled {len(remove)}.")
+
+
+def cmd_comments(args):
+    if isinstance(args.id, IssueRef):
+        b = backend(args.id.repo)
+        comments = b.comments(args.id.number)
+        for c in comments:
+            text = c["body"].strip().replace("\n", "\n      ")
+            print(f"  [{c['id']}] {c['created'][:10]} {c['author']}: {text}")
+        if not comments:
+            print("No comments.")
+        return
+    comments = api("GET", f"/tasks/{args.id}/comments") or []
+    for c in comments:
+        print(fmt_comment(c))
+    if not comments:
+        print("No comments.")
+
+
+def cmd_comment_add(args):
+    if isinstance(args.id, IssueRef):
+        c = backend(args.id.repo).comment_add(args.id.number, read_arg(args.text).strip())
+        print(f"Added comment [{c['id']}]")
+        return
+    c = api("PUT", f"/tasks/{args.id}/comments", {"comment": to_html(read_arg(args.text))})
+    print(f"Added comment [{c['id']}]")
+
+
+def cmd_comment_edit(args):
+    if isinstance(args.task_id, IssueRef):
+        backend(args.task_id.repo).comment_edit(args.comment_id, read_arg(args.text).strip())
+        print(f"Updated comment [{args.comment_id}]")
+        return
+    api("POST", f"/tasks/{args.task_id}/comments/{args.comment_id}", {"comment": to_html(read_arg(args.text))})
+    print(f"Updated comment [{args.comment_id}]")
+
+
+def cmd_comment_rm(args):
+    if isinstance(args.task_id, IssueRef):
+        backend(args.task_id.repo).comment_rm(args.comment_id)
+        print(f"Deleted comment [{args.comment_id}]")
+        return
+    api("DELETE", f"/tasks/{args.task_id}/comments/{args.comment_id}")
+    print(f"Deleted comment [{args.comment_id}]")
+
+
+def is_agent_todo(t: dict) -> bool:
+    """Written by the todo-plan skill: the description starts with a Worker: line."""
+    lines = [l.strip() for l in from_html(t.get("description") or "").splitlines() if l.strip()]
+    return bool(lines) and lines[0].startswith("Worker:")
+
+
+def cmd_orchestrable(args):
+    p = issue_path(args.project)
+    if p or args.project is None:
+        found = issue_orchestrable(p) if (p or REPOS) else False
+        if p:
+            if not found:
+                sys.exit(f"'{args.project}' has no open todos written for agents "
+                         "(none starts with a Worker: line).")
+            return
+    else:
+        found = False
+    pids = project_ids("all") if args.project is None else [resolve_project(args.project)]
+    by_id = {p["id"]: p for p in api_all("/projects")}
+    everywhere, memo = open_tasks_everywhere(), {}
+    for pid in pids:
+        tasks = [t for t in everywhere.values() if t.get("project_id") == pid and is_agent_todo(t)]
+        if not tasks:
+            continue
+        found = True
+        buckets, where = kanban_buckets(pid)
+        counts = {"ready": 0, "doing": 0, "blocked": 0}
+        for t in tasks:
+            if buckets.get(where.get(t["id"], 0), "").lower() == "doing":
+                counts["doing"] += 1
+            elif blocked_depth(t["id"], everywhere, memo) > 0:
+                counts["blocked"] += 1
+            else:
+                counts["ready"] += 1
+        print(f"  {project_path(pid, by_id)}: {counts['ready']} ready, {counts['doing']} doing, {counts['blocked']} blocked")
+    if not found:
+        what = f"'{args.project}' has" if args.project else "No project has"
+        sys.exit(f"{what} no open todos written for agents (none starts with a Worker: line).")
+
+
+# ── issue backends (GitHub, Forgejo) ──────────────────────────────────────────
+#
+# A todo project mapped to a repo in specific-todo:repos keeps its todos as that
+# repo's issues. The repo's host picks the backend: github.com is GitHub, any
+# other host is a Forgejo. Paths under the project: PROJECT is every open issue,
+# PROJECT/EFFORT a tracking issue labelled "effort", PROJECT/EFFORT/SPRINT the
+# milestone "EFFORT/SPRINT". A todo is named HOST/OWNER/NAME#N.
+
+EFFORT_LABEL = "effort"
+DOING_LABEL = "doing"
+REF_RE = re.compile(r"^(?P<host>[^/#\s]+)/(?P<owner>[^/#\s]+)/(?P<name>[^/#\s]+)#(?P<number>\d+)$")
+SHORT_REF_RE = re.compile(r"^(?P<project>[^#]+)#(?P<number>\d+)$")
+ISSUE_REFUSED = ("{what} is not available for issue projects. Keep todos that need "
+                 "it in a Vikunja project.")
+REPOS: dict[str, str] = {}
+FORGEJO_TOKEN_FILES: dict[str, str] = {}
+
+
+def user_data(scope: str, key: str):
+    """A preference from the user data provider, None when unset or unreachable."""
+    config = Path.home() / ".config" / "agent-tools" / "config.json"
+    try:
+        helper = json.loads(config.read_text())["user_data_helper"]
+    except (OSError, ValueError, KeyError):
+        return None
+    import subprocess
+    proc = subprocess.run([str(Path(helper).expanduser()), "get", "--scope", scope, "--key", key],
+                          capture_output=True, text=True)
+    if proc.returncode == 1:
+        return None
+    if proc.returncode != 0:
+        # Vikunja projects still work, only the issue projects are missing.
+        print(f"warning: user data provider failed reading {scope}:{key}, "
+              f"issue projects are unavailable: {proc.stderr.strip()}", file=sys.stderr)
+        return None
+    return json.loads(proc.stdout)["value"]
+
+
+def load_repos(repos_json: str | None, tokens_json: str | None) -> None:
+    repos = json.loads(repos_json) if repos_json else user_data("specific-todo", "repos")
+    tokens = (json.loads(tokens_json) if tokens_json
+              else user_data("specific-todo", "forgejo.token_files"))
+    for name, repo in (repos or {}).items():
+        if not isinstance(repo, str) or len(repo.split("/")) != 3:
+            sys.exit(f"specific-todo:repos: {name!r} must map to HOST/OWNER/NAME")
+        REPOS[name] = repo
+    FORGEJO_TOKEN_FILES.update(tokens or {})
+
+
+class IssueRef:
+    def __init__(self, repo: str, number: int):
+        self.repo, self.number = repo, number
+
+    def __str__(self):
+        return f"{self.repo}#{self.number}"
+
+    def __eq__(self, other):
+        return isinstance(other, IssueRef) and str(self) == str(other)
+
+    def __hash__(self):
+        return hash(str(self))
+
+
+def task_ref(s: str):
+    """A Vikunja id (an int), or an issue as HOST/OWNER/NAME#N or PROJECT#N."""
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    m = REF_RE.match(s)
+    if m:
+        return IssueRef(f"{m['host']}/{m['owner']}/{m['name']}", int(m["number"]))
+    m = SHORT_REF_RE.match(s)
+    if m:
+        repo = mapped_repo(m["project"])
+        if repo:
+            return IssueRef(repo, int(m["number"]))
+    raise argparse.ArgumentTypeError(
+        f"not a todo id: {s!r} (a number, HOST/OWNER/NAME#N or PROJECT#N)")
+
+
+def mapped_repo(project: str) -> str | None:
+    for name, repo in REPOS.items():
+        if name.lower() == project.strip().lower():
+            return repo
+    return None
+
+
+class IssuePath:
+    """A project path on an issue backend: the repo, an effort, or a sprint."""
+
+    def __init__(self, project: str, repo: str, effort: str | None, sprint: str | None):
+        self.project, self.repo, self.effort, self.sprint = project, repo, effort, sprint
+
+    def __str__(self):
+        return "/".join(p for p in (self.project, self.effort, self.sprint) if p)
+
+    @property
+    def milestone(self) -> str | None:
+        return f"{self.effort}/{self.sprint}" if self.sprint else None
+
+
+def issue_path(name: str | None) -> IssuePath | None:
+    if not name or name == "all":
+        return None
+    parts = [p.strip() for p in str(name).split("/")]
+    for project, repo in REPOS.items():
+        if parts[0].lower() == project.lower():
+            if len(parts) > 3:
+                sys.exit(f"'{name}': an issue project has at most PROJECT/EFFORT/SPRINT.")
+            return IssuePath(project, repo, *(parts[1:] + [None, None])[:2])
+    return None
+
+
+class Backend:
+    def __init__(self, repo: str):
+        self.repo = repo
+        self.host, self.owner, self.name = repo.split("/")
+
+    def ref(self, number: int) -> IssueRef:
+        return IssueRef(self.repo, number)
+
+
+class GitHub(Backend):
+    def gh(self, method: str, path: str, body=None, paginate: bool = False):
+        import subprocess
+        argv = ["gh", "api", "-X", method, path, "-H", "Accept: application/vnd.github+json"]
+        if paginate:
+            # Without --slurp (gh before 2.48), one item per line is the safe merge.
+            argv += ["--paginate", "--jq", ".[]"]
+        if body is not None:
+            argv += ["--input", "-"]
+        proc = subprocess.run(argv, input=json.dumps(body) if body is not None else None,
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            sys.exit(f"GitHub API error ({method} {path}): {proc.stderr.strip() or proc.stdout.strip()}")
+        out = proc.stdout.strip()
+        if paginate:
+            return [json.loads(line) for line in out.splitlines() if line.strip()]
+        return json.loads(out) if out else None
+
+    @property
+    def base(self):
+        return f"/repos/{self.owner}/{self.name}"
+
+    def issues(self, state: str = "open", milestone: dict | None = None,
+               label: str | None = None) -> list[dict]:
+        q = f"?state={state}&per_page=100"
+        if milestone:
+            q += f"&milestone={milestone['number']}"
+        if label:
+            q += f"&labels={urllib.parse.quote(label)}"
+        items = self.gh("GET", f"{self.base}/issues{q}", paginate=True) or []
+        return [norm_github(i) for i in items if "pull_request" not in i]
+
+    def issue(self, number: int) -> dict:
+        return norm_github(self.gh("GET", f"{self.base}/issues/{number}"))
+
+    def create(self, title: str, body: str, milestone: dict | None, labels: list[str]) -> dict:
+        data = {"title": title, "body": body, "labels": labels}
+        if milestone:
+            data["milestone"] = milestone["number"]
+        return norm_github(self.gh("POST", f"{self.base}/issues", data))
+
+    def update(self, number: int, **fields) -> dict:
+        if "milestone" in fields:
+            fields["milestone"] = fields["milestone"]["number"] if fields["milestone"] else None
+        return norm_github(self.gh("PATCH", f"{self.base}/issues/{number}", fields))
+
+    def delete(self, issue: dict) -> None:
+        q = "mutation($id: ID!) { deleteIssue(input: {issueId: $id}) { clientMutationId } }"
+        import subprocess
+        proc = subprocess.run(["gh", "api", "graphql", "-f", f"query={q}", "-f", f"id={issue['node_id']}"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            sys.exit(f"GitHub API error (delete issue): {proc.stderr.strip()}")
+
+    def add_label(self, number: int, label: str) -> None:
+        self.gh("POST", f"{self.base}/issues/{number}/labels", {"labels": [label]})
+
+    def remove_label(self, number: int, label: str) -> None:
+        if label in self.issue(number)["labels"]:
+            self.gh("DELETE", f"{self.base}/issues/{number}/labels/{urllib.parse.quote(label)}")
+
+    def blockers(self, number: int) -> list[dict]:
+        items = self.gh("GET", f"{self.base}/issues/{number}/dependencies/blocked_by", paginate=True) or []
+        return [norm_github(i) for i in items]
+
+    def blocking(self, number: int) -> list[dict]:
+        items = self.gh("GET", f"{self.base}/issues/{number}/dependencies/blocking", paginate=True) or []
+        return [norm_github(i) for i in items]
+
+    def add_blocker(self, number: int, blocker: dict) -> None:
+        self.gh("POST", f"{self.base}/issues/{number}/dependencies/blocked_by",
+                {"issue_id": blocker["db_id"]})
+
+    def remove_blocker(self, number: int, blocker: dict) -> None:
+        self.gh("DELETE", f"{self.base}/issues/{number}/dependencies/blocked_by/{blocker['db_id']}")
+
+    def subtasks(self, number: int) -> list[dict]:
+        return [norm_github(i) for i in
+                self.gh("GET", f"{self.base}/issues/{number}/sub_issues", paginate=True) or []]
+
+    def add_subtask(self, parent: int, child: dict) -> None:
+        self.gh("POST", f"{self.base}/issues/{parent}/sub_issues", {"sub_issue_id": child["db_id"]})
+
+    def comments(self, number: int) -> list[dict]:
+        items = self.gh("GET", f"{self.base}/issues/{number}/comments", paginate=True) or []
+        return [norm_comment(c) for c in items]
+
+    def comment_add(self, number: int, body: str) -> dict:
+        return norm_comment(self.gh("POST", f"{self.base}/issues/{number}/comments", {"body": body}))
+
+    def comment_edit(self, comment_id: int, body: str) -> None:
+        self.gh("PATCH", f"{self.base}/issues/comments/{comment_id}", {"body": body})
+
+    def comment_rm(self, comment_id: int) -> None:
+        self.gh("DELETE", f"{self.base}/issues/comments/{comment_id}")
+
+    def milestones(self) -> list[dict]:
+        items = self.gh("GET", f"{self.base}/milestones?state=all&per_page=100", paginate=True) or []
+        return [{"id": m["number"], "number": m["number"], "title": m["title"],
+                 "description": m.get("description") or "", "state": m["state"]} for m in items]
+
+    def milestone_add(self, title: str, description: str) -> dict:
+        m = self.gh("POST", f"{self.base}/milestones", {"title": title, "description": description})
+        return {"id": m["number"], "number": m["number"], "title": m["title"]}
+
+    def milestone_edit(self, milestone: dict, **fields) -> None:
+        self.gh("PATCH", f"{self.base}/milestones/{milestone['number']}", fields)
+
+
+def norm_github(i: dict) -> dict:
+    return {
+        "number": i["number"],
+        "db_id": i["id"],
+        "node_id": i.get("node_id"),
+        "repo": "/".join(["github.com"] + (i.get("repository_url") or "").split("/")[-2:])
+        if i.get("repository_url") else None,
+        "title": i["title"],
+        "body": i.get("body") or "",
+        "done": i["state"] == "closed",
+        "labels": [l["name"] if isinstance(l, dict) else l for l in i.get("labels") or []],
+        "milestone": (i.get("milestone") or {}).get("title"),
+    }
+
+
+def norm_comment(c: dict) -> dict:
+    return {"id": c["id"], "body": c.get("body") or "",
+            "author": (c.get("user") or {}).get("login", "?"), "created": c.get("created_at", "")}
+
+
+class Forgejo(Backend):
+    def token(self) -> str:
+        path = FORGEJO_TOKEN_FILES.get(self.host)
+        if not path:
+            sys.exit(f"No Forgejo token for {self.host}: set specific-todo:forgejo.token_files")
+        raw = Path(path).expanduser().read_text().strip()
+        return json.loads(raw)["token"] if raw.startswith("{") else raw
+
+    def api(self, method: str, path: str, body=None):
+        url = f"https://{self.host}/api/v1{path}"
+        return request(method, url, body, {"Authorization": f"token {self.token()}"})
+
+    def all(self, path: str) -> list:
+        out: list = []
+        sep = "&" if "?" in path else "?"
+        for page in range(1, 1000):
+            chunk = self.api("GET", f"{path}{sep}limit=50&page={page}") or []
+            out += chunk
+            if len(chunk) < 50:
+                return out
+        return out
+
+    @property
+    def base(self):
+        return f"/repos/{self.owner}/{self.name}"
+
+    def norm(self, i: dict) -> dict:
+        repo = i.get("repository") or {}
+        full = repo.get("full_name") or f"{repo.get('owner', self.owner)}/{repo.get('name', self.name)}"
+        return {
+            "number": i["number"],
+            "db_id": i["id"],
+            "repo": f"{self.host}/{full}" if repo else self.repo,
+            "title": i["title"],
+            "body": i.get("body") or "",
+            "done": i["state"] == "closed",
+            "labels": [l["name"] for l in i.get("labels") or []],
+            "milestone": (i.get("milestone") or {}).get("title"),
+        }
+
+    def issues(self, state: str = "open", milestone: dict | None = None,
+               label: str | None = None) -> list[dict]:
+        q = f"?state={state}&type=issues"
+        if milestone:
+            q += f"&milestones={urllib.parse.quote(milestone['title'])}"
+        if label:
+            q += f"&labels={urllib.parse.quote(label)}"
+        return [self.norm(i) for i in self.all(f"{self.base}/issues{q}")]
+
+    def issue(self, number: int) -> dict:
+        return self.norm(self.api("GET", f"{self.base}/issues/{number}"))
+
+    def label_id(self, label: str) -> int:
+        for l in self.all(f"{self.base}/labels"):
+            if l["name"].lower() == label.lower():
+                return l["id"]
+        return self.api("POST", f"{self.base}/labels", {"name": label, "color": "#888888"})["id"]
+
+    def create(self, title: str, body: str, milestone: dict | None, labels: list[str]) -> dict:
+        data = {"title": title, "body": body, "labels": [self.label_id(l) for l in labels]}
+        if milestone:
+            data["milestone"] = milestone["id"]
+        return self.norm(self.api("POST", f"{self.base}/issues", data))
+
+    def update(self, number: int, **fields) -> dict:
+        if "milestone" in fields:
+            fields["milestone"] = fields["milestone"]["id"] if fields["milestone"] else 0
+        return self.norm(self.api("PATCH", f"{self.base}/issues/{number}", fields))
+
+    def delete(self, issue: dict) -> None:
+        self.api("DELETE", f"{self.base}/issues/{issue['number']}")
+
+    def add_label(self, number: int, label: str) -> None:
+        self.api("POST", f"{self.base}/issues/{number}/labels", {"labels": [self.label_id(label)]})
+
+    def remove_label(self, number: int, label: str) -> None:
+        if label in self.issue(number)["labels"]:
+            self.api("DELETE", f"{self.base}/issues/{number}/labels/{self.label_id(label)}")
+
+    def blockers(self, number: int) -> list[dict]:
+        return [self.norm(i) for i in self.all(f"{self.base}/issues/{number}/dependencies")]
+
+    def blocking(self, number: int) -> list[dict]:
+        return [self.norm(i) for i in self.all(f"{self.base}/issues/{number}/blocks")]
+
+    def meta(self, issue: dict) -> dict:
+        _, owner, name = (issue.get("repo") or self.repo).split("/")
+        return {"owner": owner, "repo": name, "index": issue["number"]}
+
+    def add_blocker(self, number: int, blocker: dict) -> None:
+        self.api("POST", f"{self.base}/issues/{number}/dependencies", self.meta(blocker))
+
+    def remove_blocker(self, number: int, blocker: dict) -> None:
+        self.api("DELETE", f"{self.base}/issues/{number}/dependencies", self.meta(blocker))
+
+    def subtasks(self, number: int) -> list[dict]:
+        return []
+
+    def add_subtask(self, parent: int, child: dict) -> None:
+        sys.exit("Forgejo issues have no subtasks. Use --after for order, or a checklist "
+                 "in the parent's description.")
+
+    def comments(self, number: int) -> list[dict]:
+        return [{"id": c["id"], "body": c.get("body") or "",
+                 "author": (c.get("user") or {}).get("login", "?"), "created": c.get("created_at", "")}
+                for c in self.api("GET", f"{self.base}/issues/{number}/comments") or []]
+
+    def comment_add(self, number: int, body: str) -> dict:
+        c = self.api("POST", f"{self.base}/issues/{number}/comments", {"body": body})
+        return {"id": c["id"]}
+
+    def comment_edit(self, comment_id: int, body: str) -> None:
+        self.api("PATCH", f"{self.base}/issues/comments/{comment_id}", {"body": body})
+
+    def comment_rm(self, comment_id: int) -> None:
+        self.api("DELETE", f"{self.base}/issues/comments/{comment_id}")
+
+    def milestones(self) -> list[dict]:
+        return [{"id": m["id"], "number": m["id"], "title": m["title"],
+                 "description": m.get("description") or "", "state": m["state"]}
+                for m in self.all(f"{self.base}/milestones?state=all")]
+
+    def milestone_add(self, title: str, description: str) -> dict:
+        m = self.api("POST", f"{self.base}/milestones", {"title": title, "description": description})
+        return {"id": m["id"], "number": m["id"], "title": m["title"]}
+
+    def milestone_edit(self, milestone: dict, **fields) -> None:
+        self.api("PATCH", f"{self.base}/milestones/{milestone['id']}", fields)
+
+
+def backend(repo: str) -> Backend:
+    return GitHub(repo) if repo.split("/")[0] == "github.com" else Forgejo(repo)
+
+
+def settled(lookup):
+    """Retry a lookup that finds nothing: a just-created issue or milestone shows
+    up in GitHub's lists only after a few seconds."""
+    import time
+    for wait in (0, 2, 4, 8):
+        time.sleep(wait)
+        found = lookup()
+        if found:
+            return found
+    return None
+
+
+def find_milestone(b: Backend, title: str, retry: bool = True) -> dict | None:
+    look = lambda: next((m for m in b.milestones() if m["title"].lower() == title.lower()), None)
+    return settled(look) if retry else look()
+
+
+def find_effort(b: Backend, effort: str, retry: bool = True) -> dict | None:
+    look = lambda: next((i for i in b.issues("all", label=EFFORT_LABEL)
+                         if i["title"].lower() == effort.lower()), None)
+    return settled(look) if retry else look()
+
+
+def resolve_issue_path(p: IssuePath) -> tuple[Backend, dict | None, dict | None]:
+    """The backend, the effort issue and the sprint milestone a path names."""
+    b = backend(p.repo)
+    effort = sprint = None
+    if p.effort:
+        effort = find_effort(b, p.effort)
+        if not effort:
+            sys.exit(f"Project '{p}' not found: {p.repo} has no effort issue '{p.effort}'.")
+    if p.sprint:
+        sprint = find_milestone(b, p.milestone)
+        if not sprint:
+            sys.exit(f"Project '{p}' not found: {p.repo} has no milestone '{p.milestone}'.")
+    return b, effort, sprint
+
+
+def fmt_issue(i: dict, repo: str, indent: int = 0) -> str:
+    ref = f"{i.get('repo') or repo}#{i['number']}"
+    line = f"{'  ' * indent}{'✓' if i['done'] else '○'} [{ref} #{i['number']}] {i['title']}"
+    if DOING_LABEL in i["labels"] and not i["done"]:
+        line += "  [Doing]"
+    return line
+
+
+def refuse_dates(args) -> None:
+    for flag, what in (("due", "A due date"), ("start", "A start date"), ("repeat", "A repeat")):
+        if getattr(args, flag, None):
+            sys.exit(ISSUE_REFUSED.format(what=what))
+
+
+def issue_of(ref: IssueRef) -> tuple[Backend, dict]:
+    b = backend(ref.repo)
+    return b, b.issue(ref.number)
+
+
+def issue_blocked_depth(b: Backend, number: int, memo: dict[int, int]) -> int:
+    if number not in memo:
+        memo[number] = 0
+        open_prereqs = [x for x in b.blockers(number) if not x["done"]]
+        memo[number] = 1 + max((issue_blocked_depth(b, x["number"], memo)
+                                for x in open_prereqs if (x.get("repo") or b.repo) == b.repo),
+                               default=-1)
+        if any((x.get("repo") or b.repo) != b.repo for x in open_prereqs):
+            memo[number] = max(memo[number], 1)
+    return memo[number]
+
+
+def issue_list(p: IssuePath, args) -> None:
+    b, effort, sprint = resolve_issue_path(p)
+    if p.effort and not p.sprint:
+        sprints = [f"{p.project}/{m['title']}" for m in b.milestones()
+                   if m["title"].lower().startswith(p.effort.lower() + "/")]
+        sys.exit(f"'{p}' is an effort, its todos are in its sprints: {', '.join(sprints) or 'none yet'}")
+    issues = b.issues("all" if args.all else "open", sprint)
+    issues = [i for i in issues if EFFORT_LABEL not in i["labels"]]
+    if not issues:
+        print("No tasks." if args.all else "No open tasks.")
+        return
+    memo: dict[int, int] = {}
+    shown = 0
+    for i in sorted(issues, key=lambda i: i["number"]):
+        if args.max_blocked_depth is not None and not i["done"]:
+            if issue_blocked_depth(b, i["number"], memo) > args.max_blocked_depth:
+                continue
+        waits = [x for x in b.blockers(i["number"]) if not x["done"]] if not i["done"] else []
+        line = fmt_issue(i, b.repo)
+        if waits:
+            line += "  after:" + ",".join(f"{x.get('repo') or b.repo}#{x['number']}" for x in waits)
+        print(line)
+        shown += 1
+    if not shown:
+        print(f"No tasks with blocked depth {args.max_blocked_depth} or less.")
+
+
+def issue_show(ref: IssueRef) -> None:
+    b, i = issue_of(ref)
+    print(fmt_issue(i, b.repo))
+    if i["milestone"]:
+        print(f"  sprint: {i['milestone']}")
+    for line in i["body"].splitlines():
+        print(f"  {line}" if line else "")
+    for sub in b.subtasks(i["number"]):
+        print(fmt_issue(sub, b.repo, indent=1))
+    for heading, rels in (("after", b.blockers(i["number"])), ("before", b.blocking(i["number"]))):
+        if rels:
+            print(f"  {heading}:")
+            for rel in rels:
+                print(fmt_issue(rel, b.repo, indent=2))
+    comments = b.comments(i["number"])
+    if comments:
+        print("  comments:")
+        for c in comments:
+            text = c["body"].strip().replace("\n", "\n      ")
+            print(f"  [{c['id']}] {c['created'][:10]} {c['author']}: {text}")
+
+
+def issue_add(p: IssuePath, args) -> None:
+    refuse_dates(args)
+    b, effort, sprint = resolve_issue_path(p)
+    if p.effort and not p.sprint:
+        sys.exit(f"'{p}' is an effort: add todos to one of its sprints, {p}/SPRINT.")
+    # Check everything before creating, so a refusal leaves no stray issue.
+    prereqs = [as_issue_ref(a, b) for a in args.after]
+    targets = [prereq_target(b, prereq) for prereq in prereqs]
+    parent = None
+    if args.parent is not None:
+        parent = as_issue_ref(args.parent, b)
+        if parent.repo != b.repo:
+            sys.exit("A subtask must be in its parent's repo.")
+        if isinstance(b, Forgejo):
+            b.add_subtask(parent.number, {})
+        b.issue(parent.number)
+    body = read_arg(args.description).strip() if args.description is not None else ""
+    i = b.create(args.title, body, sprint, [])
+    if parent:
+        b.add_subtask(parent.number, i)
+    for target in targets:
+        b.add_blocker(i["number"], target)
+    print(f"Created: {fmt_issue(i, b.repo)}")
+
+
+def as_issue_ref(x, b: Backend) -> IssueRef:
+    if isinstance(x, IssueRef):
+        return x
+    sys.exit(f"[{x}] is a Vikunja task: an issue can only wait for another issue.")
+
+
+def issue_waits_for(b: Backend, number: int, target: IssueRef) -> bool:
+    stack, seen = [number], set()
+    while stack:
+        n = stack.pop()
+        if b.ref(n) == target:
+            return True
+        if n not in seen:
+            seen.add(n)
+            stack += [x["number"] for x in b.blockers(n) if (x.get("repo") or b.repo) == b.repo]
+    return False
+
+
+def prereq_target(b: Backend, prereq: IssueRef) -> dict:
+    """The issue a todo in b's repo is to wait for, checked to exist on the same host."""
+    pb = backend(prereq.repo)
+    if type(pb) is not type(b) or pb.host != b.host:
+        sys.exit(f"[{prereq}] is on another host: an issue can only wait for an issue "
+                 f"on {b.host}.")
+    target = pb.issue(prereq.number)
+    target["repo"] = prereq.repo
+    return target
+
+
+def issue_add_prereq(b: Backend, issue: dict, prereq: IssueRef) -> None:
+    me = b.ref(issue["number"])
+    if prereq == me or (prereq.repo == b.repo and issue_waits_for(b, prereq.number, me)):
+        sys.exit(f"[{prereq}] already waits for [{me}]; that would be a cycle.")
+    b.add_blocker(issue["number"], prereq_target(b, prereq))
+
+
+def issue_dep(ref: IssueRef, prereqs: list, add: bool) -> None:
+    b, i = issue_of(ref)
+    for prereq in prereqs:
+        prereq = as_issue_ref(prereq, b)
+        if add:
+            issue_add_prereq(b, i, prereq)
+            print(f"[{ref}] now waits for [{prereq}]")
+            continue
+        match = next((x for x in b.blockers(i["number"])
+                      if IssueRef(x.get("repo") or b.repo, x["number"]) == prereq), None)
+        if not match:
+            sys.exit(f"[{ref}] does not wait for [{prereq}].")
+        match["repo"] = match.get("repo") or b.repo
+        b.remove_blocker(i["number"], match)
+        print(f"[{ref}] no longer waits for [{prereq}]")
+
+
+def issue_edit(ref: IssueRef, args) -> None:
+    refuse_dates(args)
+    b, i = issue_of(ref)
+    fields = {}
+    if args.title:
+        fields["title"] = args.title
+    if args.description is not None:
+        fields["body"] = read_arg(args.description).strip()
+    if args.project:
+        p = issue_path(args.project)
+        if not p or p.repo != b.repo:
+            sys.exit(f"[{ref}] can only move within {b.repo}: give a sprint path of its project.")
+        _, _, sprint = resolve_issue_path(p)
+        fields["milestone"] = sprint
+    i = b.update(ref.number, **fields) if fields else i
+    print(f"Updated: {fmt_issue(i, b.repo)}")
+
+
+def issue_bucket(ref: IssueRef, bucket: str) -> None:
+    b, i = issue_of(ref)
+    name = bucket.strip().lower()
+    if "todo".startswith(name) or "to-do".startswith(name):
+        b.remove_label(ref.number, DOING_LABEL)
+        if i["done"]:
+            b.update(ref.number, state="open")
+        where = "Todo"
+    elif "doing".startswith(name):
+        b.add_label(ref.number, DOING_LABEL)
+        if i["done"]:
+            b.update(ref.number, state="open")
+        where = "Doing"
+    elif "done".startswith(name):
+        b.remove_label(ref.number, DOING_LABEL)
+        b.update(ref.number, state="closed")
+        where = "Done"
+    else:
+        sys.exit(f"Bucket '{bucket}' not found. Available: Todo, Doing, Done")
+    print(f"Moved [{ref}] to {where}: {i['title']}")
+
+
+def issue_done(ref: IssueRef) -> None:
+    b, i = issue_of(ref)
+    b.remove_label(ref.number, DOING_LABEL)
+    b.update(ref.number, state="closed")
+    print(f"Done: [{ref}] {i['title']}")
+
+
+def issue_project_add(parent: IssuePath, args) -> None:
+    b, _, _ = resolve_issue_path(parent)
+    description = read_arg(args.description).strip() if args.description else ""
+    if parent.sprint:
+        sys.exit(f"'{parent}' is a sprint: an issue project has only PROJECT/EFFORT/SPRINT.")
+    if parent.effort:
+        title = f"{parent.effort}/{args.title}"
+        if find_milestone(b, title, retry=False):
+            sys.exit(f"'{parent}/{args.title}' exists already.")
+        m = b.milestone_add(title, description)
+        print(f"Created project [{b.repo} milestone {m['number']}] {parent}/{args.title}")
+        return
+    if args.title.lower() == "senare":
+        sys.exit(ISSUE_REFUSED.format(what="Parking in Senare"))
+    if find_effort(b, args.title, retry=False):
+        sys.exit(f"'{parent}/{args.title}' exists already.")
+    i = b.create(args.title, description, None, [EFFORT_LABEL])
+    print(f"Created project [{b.repo}#{i['number']}] {parent}/{args.title}")
+
+
+def issue_project_show(p: IssuePath) -> None:
+    b, effort, sprint = resolve_issue_path(p)
+    print(f"[{p.repo}] {p}")
+    text = sprint["description"] if sprint else effort["body"] if effort else ""
+    for line in text.splitlines():
+        print(f"  {line}" if line else "")
+    if sprint:
+        return
+    if effort:
+        prefix = p.effort.lower() + "/"
+        for m in b.milestones():
+            if m["title"].lower().startswith(prefix):
+                closed = " (closed)" if m["state"] == "closed" else ""
+                print(f"  sub: [milestone {m['number']}] {m['title'][len(prefix):]}{closed}")
+        return
+    for i in sorted(b.issues("all", label=EFFORT_LABEL), key=lambda i: i["number"]):
+        print(f"  sub: [{b.repo}#{i['number']}] {i['title']}" + (" (closed)" if i["done"] else ""))
+
+
+def issue_project_edit(p: IssuePath, args) -> None:
+    b, effort, sprint = resolve_issue_path(p)
+    description = read_arg(args.description).strip() if args.description is not None else None
+    if sprint:
+        fields = {}
+        if args.title:
+            fields["title"] = f"{p.effort}/{args.title}"
+        if description is not None:
+            fields["description"] = description
+        b.milestone_edit(sprint, **fields)
+    elif effort:
+        fields = {}
+        if args.title:
+            fields["title"] = args.title
+        if description is not None:
+            fields["body"] = description
+        b.update(effort["number"], **fields)
+    else:
+        sys.exit(f"'{p}' is the repo {p.repo}: edit it on its host.")
+    print(f"Updated project {p}")
+
+
+def issue_orchestrable(only: IssuePath | None) -> bool:
+    """Print each sprint path of an issue project that has open agent todos."""
+    found = False
+    projects = [(only.project, only.repo)] if only else list(REPOS.items())
+    for project, repo in projects:
+        b = backend(repo)
+        counts: dict[str, dict[str, int]] = {}
+        memo: dict[int, int] = {}
+        for i in b.issues("open"):
+            if EFFORT_LABEL in i["labels"] or not i["body"].lstrip().startswith("Worker:"):
+                continue
+            path = "/".join([project, i["milestone"]]) if i["milestone"] else project
+            if only and str(only).lower() != path.lower() and (only.effort or only.sprint):
+                continue
+            c = counts.setdefault(path, {"ready": 0, "doing": 0, "blocked": 0})
+            if DOING_LABEL in i["labels"]:
+                c["doing"] += 1
+            elif issue_blocked_depth(b, i["number"], memo) > 0:
+                c["blocked"] += 1
+            else:
+                c["ready"] += 1
+        for path, c in sorted(counts.items()):
+            found = True
+            print(f"  {path}: {c['ready']} ready, {c['doing']} doing, {c['blocked']} blocked")
+    return found
+
+
+# ── parser ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="todo",
+        description="Task manager CLI. Vikunja projects, plus projects mapped to a repo "
+                    "(specific-todo:repos), whose todos are that repo's GitHub or Forgejo "
+                    "issues, named HOST/OWNER/NAME#N or PROJECT#N.")
+    parser.add_argument("--repos", default=None, metavar="JSON",
+                        help="project to HOST/OWNER/NAME map, overrides specific-todo:repos")
+    parser.add_argument("--forgejo-token-files", default=None, metavar="JSON",
+                        help="host to token file map, overrides specific-todo:forgejo.token_files")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def command(name, func, help, **kwargs):
+        p = sub.add_parser(name, help=help, **kwargs)
+        p.set_defaults(func=func)
+        return p
+
+    command("login", cmd_login, "authenticate and store token").add_argument(
+        "--url", default="", help=f"instance URL (default: {DEFAULT_URL})")
+
+    p = command("token", cmd_token, "store an API token directly")
+    p.add_argument("token", help="API token from Settings → API Tokens")
+    p.add_argument("--url", default="", help=f"instance URL (default: {DEFAULT_URL})")
+
+    command("projects", cmd_projects, "list projects").add_argument(
+        "--archived", "-a", action="store_true", help="include archived projects")
+
+    p = command("project-add", cmd_project_add, "create a project")
+    p.add_argument("title", help="project title")
+    p.add_argument("--parent", default=None, help="parent project name, path or id (makes a subproject)")
+    p.add_argument("--description", "-D", default=None, help="project description ('-' reads stdin)")
+
+    p = command("project-show", cmd_project_show, "show a project's path, description and subprojects")
+    p.add_argument("project", help="project name, path (A/B) or id")
+
+    p = command("project-edit", cmd_project_edit, "rename a project or replace its description")
+    p.add_argument("project", help="project name, path (A/B) or id")
+    p.add_argument("--title", default=None, help="new title")
+    p.add_argument("--description", "-D", default=None,
+                   help="new description ('-' reads stdin, '' clears)")
+
+    p = command("project-rm", cmd_project_rm,
+                "delete an empty project (dry run without --yes)",
+                description="Delete a project. Only an empty project is deleted: it is refused "
+                            "when it has any task (open or done) or any subproject (archived "
+                            "included), and when it is the default project. No option overrides that.")
+    p.add_argument("project", help="project name, path (A/B) or id")
+    p.add_argument("--yes", action="store_true", help="actually delete")
+
+    command("default", cmd_default, "set default project").add_argument(
+        "project", help="project name or id")
+
+    p = command("list", cmd_list, "list open tasks")
+    p.add_argument("--project", "-p", default=None, help="project name or id")
+    p.add_argument("--all", "-a", action="store_true", help="include done tasks")
+    p.add_argument("--max-blocked-depth", type=int, default=None, metavar="N",
+                   help="only tasks with at most this blocked depth: if A waits for B and B for C, "
+                        "A has 2, B 1 and C 0")
+
+    command("show", cmd_show, "show task, subtasks, and comments").add_argument(
+        "id", type=task_ref)
+
+    p = command("add", cmd_add, "create a task")
+    p.add_argument("title", help="task title")
+    p.add_argument("--project", "-p", default=None)
+    p.add_argument("--description", "-D", default=None, help="task description ('-' reads stdin)")
+    p.add_argument("--due", "-d", default=None, help="due date: YYYY-MM-DD, tomorrow, +Nd")
+    p.add_argument("--start", "-s", default=None, help="start date: YYYY-MM-DD, tomorrow, +Nd")
+    p.add_argument("--repeat", "-r", default=None, help="repeat: daily, weekly, monthly, yearly, Nd")
+    p.add_argument("--parent", type=task_ref, default=None, help="parent task id (creates subtask)")
+    p.add_argument("--after", type=task_ref, action="append", default=[], metavar="ID",
+                   help="task that must be done first (repeatable)")
+
+    command("done", cmd_done, "mark task complete").add_argument("id", type=task_ref)
+    command("rm", cmd_rm, "delete task").add_argument("id", type=task_ref)
+
+    p = command("edit", cmd_edit, "edit a task")
+    p.add_argument("id", type=task_ref)
+    p.add_argument("--title", default=None)
+    p.add_argument("--description", "-D", default=None,
+                   help="task description ('-' reads stdin, '' clears)")
+    p.add_argument("--due", default=None, help="YYYY-MM-DD, tomorrow, +Nd, or none to clear")
+    p.add_argument("--start", default=None, help="YYYY-MM-DD, tomorrow, +Nd, or none to clear")
+    p.add_argument("--repeat", default=None)
+    p.add_argument("--project", "-p", default=None, help="move task to this project (name or id)")
+
+    p = command("bucket", cmd_bucket, "move task to a kanban bucket (e.g. todo, doing, done)")
+    p.add_argument("id", type=task_ref)
+    p.add_argument("bucket", help="bucket name prefix (case-insensitive)")
+
+    p = command("purge", cmd_purge, "delete completed tasks (dry run without --yes)")
+    p.add_argument("--project", "-p", default="all", help="project name or id (default: all)")
+    p.add_argument("--older-than", default=None, metavar="AGE",
+                   help="only tasks done longer ago than this, e.g. 30d, 6w, 1y")
+    p.add_argument("--yes", action="store_true", help="actually delete")
+
+    p = command("purged", cmd_purged, f"search purged tasks archived in {PURGED_PATH}")
+    p.add_argument("text", nargs="?", default=None, help="case-insensitive text to match")
+    p.add_argument("--id", type=int, default=None, help="print one archived task as JSON")
+
+    p = command("label-subtasks", cmd_label_subtasks,
+                "label every subtask (dry run without --yes)")
+    p.add_argument("--project", "-p", default="all", help="project name or id (default: all)")
+    p.add_argument("--label", default="subtask", help="label to apply (created if missing)")
+    p.add_argument("--prune", action="store_true",
+                   help="also remove the label from tasks that are no longer subtasks")
+    p.add_argument("--yes", action="store_true", help="actually apply the changes")
+
+    p = command("label-unmet", cmd_label_unmet,
+                "label tasks by their blocked depth (dry run without --yes)")
+    p.add_argument("--project", "-p", default="all", help="project name or id (default: all)")
+    p.add_argument("--prefix", default="unfulfilled",
+                   help=f"label prefix: <prefix>1 … <prefix>{UNMET_CAP}plus")
+    p.add_argument("--yes", action="store_true", help="actually apply the changes")
+
+    p = command("label-bucket", cmd_label_bucket,
+                "label the open tasks in some kanban buckets (dry run without --yes)")
+    p.add_argument("project", help="project name or id")
+    p.add_argument("buckets", nargs="+", metavar="BUCKET", help="bucket name prefix")
+    p.add_argument("--label", default="waiting", help="label to keep in sync (default: waiting)")
+    p.add_argument("--yes", action="store_true", help="actually apply the changes")
+
+    p = command("promote", cmd_promote,
+                "move done tasks and tasks with a date coming up out of parked subprojects "
+                "into the parent "
+                "(dry run without --yes)")
+    p.add_argument("--name", default="Senare", help="subproject name (default: Senare)")
+    p.add_argument("--days", type=int, default=14, help="horizon in days (default: 14)")
+    p.add_argument("--yes", action="store_true", help="actually move the tasks")
+
+    p = command("dep-add", cmd_dep_add, "make a task wait for other tasks to be done first")
+    p.add_argument("id", type=task_ref, help="the task that has to wait")
+    p.add_argument("prereqs", type=task_ref, nargs="+", metavar="PREREQ", help="tasks to do first")
+
+    p = command("dep-rm", cmd_dep_rm, "remove dependencies added with dep-add")
+    p.add_argument("id", type=task_ref)
+    p.add_argument("prereqs", type=task_ref, nargs="+", metavar="PREREQ")
+
+    command("comments", cmd_comments, "list comments on a task").add_argument("id", type=task_ref)
+
+    p = command("comment-add", cmd_comment_add, "add a comment to a task")
+    p.add_argument("id", type=task_ref, help="task id")
+    p.add_argument("text", help="comment text ('-' reads stdin)")
+
+    p = command("comment-edit", cmd_comment_edit, "edit a comment")
+    p.add_argument("task_id", type=task_ref)
+    p.add_argument("comment_id", type=int)
+    p.add_argument("text", help="new comment text ('-' reads stdin)")
+
+    p = command("comment-rm", cmd_comment_rm, "delete a comment")
+    p.add_argument("task_id", type=task_ref)
+    p.add_argument("comment_id", type=int)
+
+    command("orchestrable", cmd_orchestrable,
+            "projects with open todos written for agents (a Worker: line), for orchestrate").add_argument(
+        "project", nargs="?", default=None, help="check only this project, exit 1 when it has none")
+
+    # Ids are parsed while the arguments are, and PROJECT#N needs the map.
+    known = argparse.ArgumentParser(add_help=False)
+    known.add_argument("--repos", default=None)
+    known.add_argument("--forgejo-token-files", default=None)
+    early, _ = known.parse_known_args()
+    load_repos(early.repos, early.forgejo_token_files)
+    args = parser.parse_args()
+    CFG.update(load_config())
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
