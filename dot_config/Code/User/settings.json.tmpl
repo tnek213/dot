@@ -10,18 +10,26 @@
 
   To add a new extension's settings: drop a new .json file in that
   directory with its flat "key": value pairs. It's picked up automatically.
+
+  Keys in the live file that match a pattern in
+  .chezmoitemplates/vscode-settings-ignore.json (`*` matches any text) and
+  that no fragment defines are carried over as they are. Since the rendered
+  file then equals the live one, chezmoi only asks about other changes.
 */ -}}
-{{- $fragments := (sortAlpha (glob (joinPath .chezmoi.sourceDir ".chezmoitemplates/vscode-settings/*.json"))) -}}
-{{- $merged := dict -}}
-{{- $owner := dict -}}
-{{- range $path := $fragments -}}
-{{-   $frag := include $path | fromJson -}}
-{{-   range $k, $v := $frag -}}
-{{-     if hasKey $owner $k -}}
-{{-       fail (printf "vscode settings: key %q is defined in both %s and %s" $k (get $owner $k) $path) -}}
+{{- $managed := includeTemplate "vscode-managed-settings" . | fromJson -}}
+{{- $patterns := include ".chezmoitemplates/vscode-settings-ignore.json" | fromJson -}}
+{{- $live := joinPath .chezmoi.homeDir ".config/Code/User/settings.json" -}}
+{{- $settings := dict -}}
+{{- if stat $live -}}
+{{-   $text := include $live -}}
+{{-   if trim $text -}}
+{{-     range $k, $v := $text | fromJsonc -}}
+{{-       range $p := $patterns -}}
+{{-         if and (not (hasKey $managed $k)) (regexMatch (printf "^%s$" (regexQuoteMeta $p | replace "\\*" ".*")) $k) -}}
+{{-           $settings = set $settings $k $v -}}
+{{-         end -}}
+{{-       end -}}
 {{-     end -}}
-{{-     $owner = set $owner $k $path -}}
 {{-   end -}}
-{{-   $merged = mergeOverwrite $merged $frag -}}
 {{- end -}}
-{{ $merged | toPrettyJson | trimSuffix "\n" }}
+{{ merge $settings $managed | toPrettyJson | trimSuffix "\n" }}

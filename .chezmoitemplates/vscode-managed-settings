@@ -1,0 +1,18 @@
+{{- /*
+  Merges the fragments in vscode-settings/*.json into one JSON object.
+  Each top-level key may be defined by only one fragment.
+*/ -}}
+{{- $fragments := (sortAlpha (glob (joinPath .chezmoi.sourceDir ".chezmoitemplates/vscode-settings/*.json"))) -}}
+{{- $merged := dict -}}
+{{- $owner := dict -}}
+{{- range $path := $fragments -}}
+{{-   $frag := include $path | fromJson -}}
+{{-   range $k, $v := $frag -}}
+{{-     if hasKey $owner $k -}}
+{{-       fail (printf "vscode settings: key %q is defined in both %s and %s" $k (get $owner $k) $path) -}}
+{{-     end -}}
+{{-     $owner = set $owner $k $path -}}
+{{-   end -}}
+{{-   $merged = mergeOverwrite $merged $frag -}}
+{{- end -}}
+{{ $merged | toJson }}

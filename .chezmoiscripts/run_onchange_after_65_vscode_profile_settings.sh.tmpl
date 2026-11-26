@@ -25,12 +25,15 @@ SHARED="$HOME/.config/Code/User/settings.json"
 PROFILES_DIR="$HOME/.config/Code/User/profiles"
 STORAGE_JSON="$HOME/.config/Code/User/globalStorage/storage.json"
 MANIFEST="$HOME/.config/Code/.chezmoi-vscode-managed-keys.json"
+# The merged fragments, not the live Default settings.json, whose ignored
+# keys (see vscode-settings-ignore.json) belong to that profile only.
+MANAGED='{{ includeTemplate "vscode-managed-settings" . | fromJson | toJson | replace "'" "'\\''" }}'
 
 [ -f "$SHARED" ] || exit 0
 [ -f "$STORAGE_JSON" ] || exit 0
 command -v jq >/dev/null 2>&1 || { echo "vscode profile sync: jq not found, skipping" >&2; exit 0; }
 
-shared_keys=$(jq -c 'keys' "$SHARED")
+shared_keys=$(jq -cn --argjson m "$MANAGED" '$m | keys')
 old_keys="[]"
 [ -f "$MANIFEST" ] && old_keys=$(jq -c '.' "$MANIFEST")
 
@@ -52,10 +55,10 @@ jq -r '.userDataProfiles[]?.location // empty' "$STORAGE_JSON" | while IFS= read
     mkdir -p "$profile_dir"
     [ -f "$profile_settings" ] || echo '{}' > "$profile_settings"
     tmp=$(mktemp)
-    jq --argjson purge "$purge_keys" --slurpfile shared "$SHARED" '
+    jq --argjson purge "$purge_keys" --argjson managed "$MANAGED" '
         . as $profile
         | (reduce $purge[] as $k ($profile; del(.[$k])))
-        | . * $shared[0]
+        | . * $managed
     ' "$profile_settings" > "$tmp" && mv "$tmp" "$profile_settings"
     echo "vscode profile sync: updated $profile_settings"
 done

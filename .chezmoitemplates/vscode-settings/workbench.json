@@ -1,5 +1,6 @@
 {
   "extensions.ignoreRecommendations": true,
   "task.allowAutomaticTasks": "on",
+  "update.mode": "none",
   "workbench.enableExperiments": false
 }

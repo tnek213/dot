@@ -2,9 +2,5 @@
   "[markdown]": {
     "editor.defaultFormatter": "esbenp.prettier-vscode"
   },
-  "editor.fontFamily": "'MonoLisa Variable', 'DejaVu Sans Mono', monospace",
-  "editor.fontLigatures": true,
-  "editor.fontSize": 14,
-  "editor.minimap.enabled": false,
-  "terminal.integrated.fontFamily": "'MonoLisa Variable', 'DejaVu Sans Mono', monospace"
+  "editor.minimap.enabled": false
 }
